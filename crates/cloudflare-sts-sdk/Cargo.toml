@@ -61,4 +61,4 @@ client = [
 [build-dependencies]
 # Generates the API from the OpenAPI document, in build.rs. Without the `cli`
 # default it is only the library: no clap, no reqwest.
-openapi-to-rust = { version = "0.20", default-features = false }
+openapi-to-rust = { version = "0.22", default-features = false }
