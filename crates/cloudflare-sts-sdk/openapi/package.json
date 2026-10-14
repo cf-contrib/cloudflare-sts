@@ -7,10 +7,10 @@
     "generate": "tsp compile sts/v1/stsv1.tsp"
   },
   "dependencies": {
-    "@typespec/compiler": "1.16.0",
-    "@typespec/http": "1.16.0",
-    "@typespec/openapi": "1.16.0",
-    "@typespec/openapi3": "1.16.0",
-    "@typespec/versioning": "0.86.0"
+    "@typespec/compiler": "1.17.0",
+    "@typespec/http": "1.17.0",
+    "@typespec/openapi": "1.17.0",
+    "@typespec/openapi3": "1.17.0",
+    "@typespec/versioning": "0.87.0"
   }
 }
