@@ -668,9 +668,9 @@ dependencies = [
  "chrono",
  "futures-util",
  "http-body-util",
- "jsonschema 0.60.1",
+ "jsonschema 0.60.2",
  "mime",
- "openapi-to-rust 0.22.0",
+ "openapi-to-rust 0.23.0",
  "reqwest",
  "reqwest-middleware",
  "serde",
@@ -1664,9 +1664,9 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.60.1"
+version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65de752665c4a06528af6759955eecf60ba73ae7442d35349963a09c8031cd71"
+checksum = "a42a11b47492e6a2cc76e9c7bcc8077776cb31dac444e0795d7f61bcc6441c08"
 dependencies = [
  "ahash",
  "bytecount",
@@ -2058,9 +2058,9 @@ dependencies = [
 
 [[package]]
 name = "openapi-to-rust"
-version = "0.22.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aed99ca35987c90d047e68fb16312dc6ee24a67080699208588a35f3f1ecfeaf"
+checksum = "3bd6e71bfeb9c084586ad4daa7373a662be1f779432f263fa291460a98803d7d"
 dependencies = [
  "heck",
  "jsonschema 0.49.9",
