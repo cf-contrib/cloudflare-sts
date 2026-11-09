@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.21.1](https://github.com/cf-contrib/cloudflare-sts/compare/v0.21.0...v0.21.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* **ci:** merge with the App token so main gets its CI run ([#117](https://github.com/cf-contrib/cloudflare-sts/issues/117)) ([b4bc8f8](https://github.com/cf-contrib/cloudflare-sts/commit/b4bc8f8a7121eae6484c2f8762f6f0abf7dca8ca))
+* **nix:** the package builds its own aws-lc, as nixpkgs links the system one since its November release ([a455ad0](https://github.com/cf-contrib/cloudflare-sts/commit/a455ad05903d2956789fc8912e243302f8ad8dd7))
+
 ## [0.21.0](https://github.com/cf-contrib/cloudflare-sts/compare/v0.20.0...v0.21.0) (2026-10-08)
 
 
