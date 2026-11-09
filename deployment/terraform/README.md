@@ -7,7 +7,7 @@
 
 ```hcl
 module "cloudflare_sts_api" {
-  source = "git::https://github.com/cf-contrib/cloudflare-sts.git//deployment/terraform?ref=v0.21.0" # x-release-please-version
+  source = "git::https://github.com/cf-contrib/cloudflare-sts.git//deployment/terraform?ref=v0.21.1" # x-release-please-version
 
   account_id              = var.account_id
   hostname                = "cloudflare-sts-api.example.workers.dev"
@@ -249,7 +249,7 @@ fails if a download doesn't match `SHA256SUMS`. To pin the artifacts too, set
 `checksums_sha256` to the SHA-256 of the release's `SHA256SUMS`:
 
 ```sh
-curl -fsSL https://github.com/cf-contrib/cloudflare-sts/releases/download/v0.21.0/SHA256SUMS | sha256sum # x-release-please-version
+curl -fsSL https://github.com/cf-contrib/cloudflare-sts/releases/download/v0.21.1/SHA256SUMS | sha256sum # x-release-please-version
 ```
 
 Set `release_tag = "latest"` to track the newest release instead.

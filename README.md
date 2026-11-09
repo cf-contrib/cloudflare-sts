@@ -21,7 +21,7 @@ permissions:
   id-token: write
 
 steps:
-  - uses: cf-contrib/cloudflare-sts@v0.21.0 # x-release-please-version
+  - uses: cf-contrib/cloudflare-sts@v0.21.1 # x-release-please-version
     with:
       url: https://cloudflare-sts-api.example.com
       profile: example-org/app:ci.deploy
