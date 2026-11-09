@@ -47,6 +47,9 @@
           ];
           # The tests run in CI, with the rest of the workspace's.
           doCheck = false;
+          # nixpkgs builds the -sys crates against the libraries of the system, since its November release, and aws-lc-sys finds none: it builds its own,
+          # as it did
+          dontCargoUseSystemLibs = true;
           meta = {
             inherit (cli) description;
             homepage = "https://github.com/cf-contrib/cloudflare-sts";
