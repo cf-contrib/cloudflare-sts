@@ -25,8 +25,8 @@ crons = ["17 * * * *"] # hourly cleanup of expired cloudflare-sts:* tokens
 CLOUDFLARE_STS_API_ACCOUNT_ID = "0123456789abcdef0123456789abcdef"
 CLOUDFLARE_STS_API_CLOUDFLARE_URL = "http://127.0.0.1:8791/cloudflare/client/v4"
 
-# The policy, from tests/policy.json, which tests/run.sh puts in the local KV
-# namespace. `mismatched`'s discovery document names another issuer, and so
+# The policy: tests/config.toml and tests/policy.cedar, which tests/run.sh puts
+# in the local KV namespace as the keys `config` and `policy`. `mismatched`'s discovery document names another issuer, and so
 # does `pinned`'s, whose keys are at its jwks_uri. `typed` takes only access
 # tokens, which the stand-ins don't sign. `access` is where people sign in,
 # shaped like an Access for SaaS OIDC app: its audience is its client ID.

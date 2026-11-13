@@ -72,16 +72,19 @@ override_data {
 }
 
 variables {
+  cedar_policy            = <<-EOT
+    @id("admit-github") permit (principal, action == Admit::Action::"github", resource) when { context.repository_owner_id == "100000001" };
+    @id("allow-workers-deploy") permit (principal, action == Profile::Action::"workers-deploy", resource);
+  EOT
   cloudflare_token_secret = { secret_store_id = "00000000000000000000000000000000", secret_name = "cloudflare-sts-cloudflare-token" }
   account_id              = "0123456789abcdef0123456789abcdef"
   hostname                = "cloudflare-sts-api.example.workers.dev"
   oidc_providers = [
-    { name = "github", issuer = "https://token.actions.githubusercontent.com", claims = [{ repository_owner_id = "100000001" }] },
+    { name = "github", issuer = "https://token.actions.githubusercontent.com" },
   ]
   profiles = [
     {
-      name   = "workers-deploy"
-      claims = [{ repository_id = "200000002", ref = "refs/heads/main", environment = "prod" }]
+      name = "workers-deploy"
       token = { policies = [{
         permissions = ["Workers Scripts Write"]
         resources   = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
@@ -145,17 +148,22 @@ run "policy_is_built_from_the_variables" {
   }
 
   assert {
-    condition     = cloudflare_workers_kv.policy.key_name == "policy" && cloudflare_workers_kv.policy.value == local.policy_json
-    error_message = "the policy should be stored under the key `policy`, as JSON"
+    condition     = cloudflare_workers_kv.config.key_name == "config" && cloudflare_workers_kv.config.value == local.config_json
+    error_message = "the configuration should be stored under the key `config`, as JSON"
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).version == 3 && jsondecode(local.policy_json).profiles[0].name == "workers-deploy"
-    error_message = "the policy should be version 3, with the profiles as given"
+    condition     = cloudflare_workers_kv.policy.key_name == "policy" && strcontains(cloudflare_workers_kv.policy.value, "Admit::Action::\"github\"")
+    error_message = "the Cedar policy should be stored as given, under the key `policy`"
   }
 
   assert {
-    condition     = !contains(keys(jsondecode(local.policy_json).providers[0]), "jwks_uri") && !contains(keys(jsondecode(local.policy_json).providers[0]), "typ") && !contains(keys(jsondecode(local.policy_json)), "defaults") && !contains(keys(jsondecode(local.policy_json).providers[0]), "client_id")
+    condition     = jsondecode(local.config_json).version == 4 && jsondecode(local.config_json).profiles[0].name == "workers-deploy"
+    error_message = "the policy should be version 4, with the profiles as given"
+  }
+
+  assert {
+    condition     = !contains(keys(jsondecode(local.config_json).providers[0]), "jwks_uri") && !contains(keys(jsondecode(local.config_json).providers[0]), "typ") && !contains(keys(jsondecode(local.config_json)), "defaults") && !contains(keys(jsondecode(local.config_json).providers[0]), "client_id")
     error_message = "unset fields should be left out, not null: the broker refuses a null"
   }
 }
@@ -165,13 +173,13 @@ run "takes_a_client_id_as_the_audience" {
 
   variables {
     oidc_providers = [
-      { name = "github", issuer = "https://token.actions.githubusercontent.com", claims = [{ repository_owner_id = "100000001" }] },
-      { name = "access", issuer = "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc", client_id = "abc", claims = [{ iss = "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc" }] },
+      { name = "github", issuer = "https://token.actions.githubusercontent.com" },
+      { name = "access", issuer = "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc", client_id = "abc" },
     ]
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).providers[1].client_id == "abc" && jsondecode(local.policy_json).providers[1].audience == "abc"
+    condition     = jsondecode(local.config_json).providers[1].client_id == "abc" && jsondecode(local.config_json).providers[1].audience == "abc"
     error_message = "a client_id should reach the policy, as the provider's audience too"
   }
 }
@@ -181,7 +189,7 @@ run "rejects_a_client_id_that_isnt_the_audience" {
 
   variables {
     oidc_providers = [
-      { name = "access", issuer = "https://example.cloudflareaccess.com", audience = "https://cloudflare-sts-api.example.com", client_id = "abc", claims = [{ type = "app" }] },
+      { name = "access", issuer = "https://example.cloudflareaccess.com", audience = "https://cloudflare-sts-api.example.com", client_id = "abc" },
     ]
   }
 
@@ -193,42 +201,42 @@ run "takes_a_providers_own_audience_jwks_uri_typ_and_defaults" {
 
   variables {
     oidc_providers = [
-      { name = "gitlab", issuer = "https://gitlab.com", audience = "https://cloudflare-sts-api.example.com/", jwks_uri = "https://gitlab.com/oauth/discovery/keys", typ = "at+jwt", claims = [{ namespace_id = "4000001" }] },
+      { name = "gitlab", issuer = "https://gitlab.com", audience = "https://cloudflare-sts-api.example.com/", jwks_uri = "https://gitlab.com/oauth/discovery/keys", typ = "at+jwt" },
     ]
     defaults = { ttl = "10m" }
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).providers[0].audience == "https://cloudflare-sts-api.example.com/" && jsondecode(local.policy_json).providers[0].jwks_uri == "https://gitlab.com/oauth/discovery/keys"
+    condition     = jsondecode(local.config_json).providers[0].audience == "https://cloudflare-sts-api.example.com/" && jsondecode(local.config_json).providers[0].jwks_uri == "https://gitlab.com/oauth/discovery/keys"
     error_message = "a provider's own audience and jwks_uri should be kept"
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).providers[0].typ == "at+jwt"
+    condition     = jsondecode(local.config_json).providers[0].typ == "at+jwt"
     error_message = "a provider's typ should reach the policy"
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).defaults == { ttl = "10m" }
+    condition     = jsondecode(local.config_json).defaults == { ttl = "10m" }
     error_message = "defaults should hold only what's set"
   }
 }
 
-run "rejects_a_provider_without_claims" {
+run "rejects_an_empty_cedar_policy" {
   command = plan
 
   variables {
-    oidc_providers = [{ name = "github", issuer = "https://token.actions.githubusercontent.com", claims = [] }]
+    cedar_policy = "  \n"
   }
 
-  expect_failures = [var.oidc_providers]
+  expect_failures = [var.cedar_policy]
 }
 
-run "rejects_a_profile_without_claims" {
+run "rejects_a_profile_without_a_name" {
   command = plan
 
   variables {
-    profiles = [{ name = "deploy", claims = [] }]
+    profiles = [{ name = "" }]
   }
 
   expect_failures = [var.profiles]
@@ -240,8 +248,7 @@ run "accepts_a_policy_over_5_kb" {
   variables {
     profiles = [
       for i in range(40) : {
-        name   = "repo-${i}"
-        claims = [{ repository_id = "2000000${i}", ref = "refs/heads/main", environment = "prod" }]
+        name = "repo-${i}"
         token = { policies = [{
           permissions = ["Workers Scripts Write"]
           resources   = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
@@ -251,7 +258,7 @@ run "accepts_a_policy_over_5_kb" {
   }
 
   assert {
-    condition     = length(local.policy_json) > 5120
+    condition     = length(local.config_json) > 5120
     error_message = "the test policy should be over what a Worker variable holds"
   }
 }
@@ -270,7 +277,7 @@ run "workers_dev" {
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).issuer == "https://cloudflare-sts-api.example.workers.dev" && jsondecode(local.policy_json).providers[0].audience == "https://cloudflare-sts-api.example.workers.dev"
+    condition     = jsondecode(local.config_json).issuer == "https://cloudflare-sts-api.example.workers.dev" && jsondecode(local.config_json).providers[0].audience == "https://cloudflare-sts-api.example.workers.dev"
     error_message = "the policy's issuer and the provider's audience should be the broker's URL"
   }
 }
@@ -432,9 +439,8 @@ run "profiles_of_any_shape" {
   variables {
     profiles = [
       {
-        name   = "terraform-state"
-        claims = [{ ref = "refs/heads/main" }]
-        ttl    = "30m"
+        name = "terraform-state"
+        ttl  = "30m"
         bucket = {
           name       = "org-terraform-state"
           permission = "object-read-write"
@@ -442,8 +448,7 @@ run "profiles_of_any_shape" {
         }
       },
       {
-        name   = "deploy-with-state"
-        claims = [{ repository_id = "200000002", environment = "prod" }]
+        name = "deploy-with-state"
         token = { policies = [{
           permissions = ["Workers Scripts Write"]
           resources   = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
@@ -455,8 +460,7 @@ run "profiles_of_any_shape" {
         }
       },
       {
-        name   = "every-zone"
-        claims = [{ environment = "dns" }]
+        name = "every-zone"
         token = { policies = [{
           permissions = ["DNS Write"]
           resources   = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = { "com.cloudflare.api.account.zone.*" = "*" } }
@@ -466,17 +470,17 @@ run "profiles_of_any_shape" {
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).profiles[0].bucket.prefixes == ["github.com/{repository}/"]
+    condition     = jsondecode(local.config_json).profiles[0].bucket.prefixes == ["github.com/{repository}/"]
     error_message = "a single-claim placeholder should reach the policy unchanged"
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).profiles[1].bucket.prefixes == ["{repository_owner_id}/{repository_id}/"]
+    condition     = jsondecode(local.config_json).profiles[1].bucket.prefixes == ["{repository_owner_id}/{repository_id}/"]
     error_message = "multi-claim placeholders should reach the policy unchanged"
   }
 
   assert {
-    condition     = jsondecode(local.policy_json).profiles[2].token.policies[0].resources["com.cloudflare.api.account.0123456789abcdef0123456789abcdef"]["com.cloudflare.api.account.zone.*"] == "*"
+    condition     = jsondecode(local.config_json).profiles[2].token.policies[0].resources["com.cloudflare.api.account.0123456789abcdef0123456789abcdef"]["com.cloudflare.api.account.zone.*"] == "*"
     error_message = "nested resources should reach the policy beside flat ones"
   }
 }

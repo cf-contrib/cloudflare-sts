@@ -16,9 +16,11 @@
 //! rotated one takes effect on the next request.
 //!
 //! The policy's format is here too: [`PolicyConfig`], its providers and
-//! profiles, their claim sets and bucket prefixes, and what parsing checks,
-//! the guardrails among it. Checking a token against a provider is in the auth
-//! [`layer`](super::layer); what a caller gets, in the
+//! profiles and bucket prefixes, and what parsing checks, the guardrails among
+//! it. It's in two parts, two KV keys: the configuration, in TOML,
+//! says what the broker trusts and what a profile hands out; the Cedar policy
+//! ([`authz`](super::authz)) says who gets it. Checking a token against a
+//! provider is in the auth [`layer`](super::layer); what a caller gets, in the
 //! [`handler`](super::handler).
 
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
@@ -32,9 +34,11 @@ use cloudflare::v4::{
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
+use tracing::warn;
 use worker::{Env, Error, SecretStore, js_sys, wasm_bindgen::JsValue};
 
-use crate::oidc::{ClaimRules, Provider, Providers, check_url};
+use super::authz::{Authz, Verdict};
+use crate::oidc::{Provider, Providers, check_url};
 
 /// The binding of the account the Cloudflare token belongs to, and tokens are
 /// minted in.
@@ -43,7 +47,9 @@ const ACCOUNT_KEY: &str = "CLOUDFLARE_STS_API_ACCOUNT_ID";
 /// The Workers KV binding the policy is read from.
 const POLICY_BINDING: &str = "CLOUDFLARE_STS_API_POLICY_KV";
 
-/// The key in that namespace holding the policy, as JSON.
+/// The keys in that namespace: the configuration, TOML (or JSON), and the
+/// Cedar policy.
+const CONFIG_KEY: &str = "config";
 const POLICY_KEY: &str = "policy";
 
 /// Where the policy was before it moved to KV: a plain-text variable. Still
@@ -158,7 +164,7 @@ async fn load_policy(env: &Env, account_id: &str) -> worker::Result<Arc<PolicyCo
         .is_ok_and(|binding| !binding.is_undefined());
     if moved {
         return Err(Error::RustError(format!(
-            "{OLD_POLICY_VAR} is no longer read: the policy is key `{POLICY_KEY}` in the Workers KV binding {POLICY_BINDING}"
+            "{OLD_POLICY_VAR} is no longer read: the policy is keys `{CONFIG_KEY}` (TOML) and `{POLICY_KEY}` (Cedar) in the Workers KV binding {POLICY_BINDING}"
         )));
     }
     let kv = env.kv(POLICY_BINDING).map_err(|why| {
@@ -166,17 +172,20 @@ async fn load_policy(env: &Env, account_id: &str) -> worker::Result<Arc<PolicyCo
             "{POLICY_BINDING} must be a Workers KV binding: {why}"
         ))
     })?;
-    let json = kv
-        .get(POLICY_KEY)
-        .text()
-        .await
-        .map_err(|why| {
-            Error::RustError(format!(
-                "{POLICY_BINDING}: `{POLICY_KEY}` can't be read: {why}"
-            ))
-        })?
-        .ok_or_else(|| Error::RustError(format!("{POLICY_BINDING}: `{POLICY_KEY}` isn't set")))?;
-    let policy = PolicyConfig::parse(&json, account_id)
+    let read = |key: &'static str| {
+        let kv = &kv;
+        async move {
+            kv.get(key)
+                .text()
+                .await
+                .map_err(|why| {
+                    Error::RustError(format!("{POLICY_BINDING}: `{key}` can't be read: {why}"))
+                })?
+                .ok_or_else(|| Error::RustError(format!("{POLICY_BINDING}: `{key}` isn't set")))
+        }
+    };
+    let (config, cedar) = (read(CONFIG_KEY).await?, read(POLICY_KEY).await?);
+    let policy = PolicyConfig::parse(&config, &cedar, account_id)
         .map(Arc::new)
         .map_err(|why| Error::RustError(format!("{POLICY_BINDING}: {why}")))?;
     POLICY.with(|held| *held.borrow_mut() = Some((now + POLICY_TTL, policy.clone())));
@@ -279,12 +288,11 @@ impl Secret {
 /// The policy: the OIDC issuers the broker trusts, its providers, and what
 /// their callers may get, its profiles.
 ///
-/// It knows no issuer by name: who may do what is in the claim sets, as in
-/// cloudflare-nix.
+/// It knows no issuer by name: who may do what is in the Cedar policy.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
-    /// The policy format's version: 3.
+    /// The configuration's format version: 4.
     version: u64,
     /// The broker's own URL: the issuer of the tokens it signs for other
     /// services.
@@ -294,28 +302,49 @@ pub struct PolicyConfig {
     #[serde(default)]
     defaults: DefaultsConfig,
     pub profiles: Vec<ProfileConfig>,
+    /// Who gets what. Not in the TOML.
+    #[serde(skip)]
+    authz: Authz,
 }
 
 impl PolicyConfig {
-    /// The policy in `json`, checked against the account tokens are minted in.
+    /// The policy: the configuration, in TOML (or JSON, which is what
+    /// Terraform writes), and the Cedar policy, checked against the account
+    /// tokens are minted in.
     ///
     /// # Errors
     ///
     /// The first problem found: the guardrails are checked here, so an unsafe
     /// policy never serves a request.
-    pub fn parse(json: &str, account_id: &str) -> Result<Self, String> {
-        let mut policy: Self = serde_json::from_str(json).map_err(|err| {
-            format!("must be a JSON policy of {{ version, issuer, providers, defaults?, profiles }}: {err}")
-        })?;
+    pub fn parse(config: &str, cedar: &str, account_id: &str) -> Result<Self, String> {
+        let bad =
+            |err: &dyn std::fmt::Display| format!("config must be TOML, or a JSON object: {err}");
+        let mut policy: Self = if config.trim_start().starts_with('{') {
+            serde_json::from_str(config).map_err(|err| bad(&err))?
+        } else {
+            toml::from_str(config).map_err(|err| bad(&err))?
+        };
         policy.check(account_id)?;
+        let authz = Authz::parse(cedar)?;
+        authz.check(
+            policy.providers.iter().map(|p| p.name.as_str()),
+            policy.profiles.iter().map(|p| (p.name.as_str(), p.enabled)),
+        )?;
+        policy.authz = authz;
         Ok(policy)
+    }
+
+    /// Whether `provider` lets the token with `claims` in at all: its tenant,
+    /// pinned. Checked as the token is verified.
+    pub fn admit(&self, provider: &str, claims: &Map<String, Value>) -> Verdict {
+        self.authz.admit(provider, claims, CLOUDFLARE_AUDIENCE)
     }
 
     /// What deserializing can't check, filling in each profile's provider and
     /// TTLs on the way.
     fn check(&mut self, account_id: &str) -> Result<(), String> {
-        if self.version != 3 {
-            return Err("version must be 3".to_string());
+        if self.version != 4 {
+            return Err("version must be 4".to_string());
         }
         check_origin(&self.issuer).map_err(|why| format!("issuer {why}"))?;
 
@@ -377,9 +406,9 @@ impl PolicyConfig {
     }
 
     /// The profile a token from `provider` with `claims` gets for
-    /// `audience`: the one `requested`, or else the only one that matches.
-    /// The token must match one of the profile's claim sets; its provider's
-    /// are checked when it's verified.
+    /// `audience`: the one `requested`, or else the only one the Cedar policy
+    /// allows. Whether its provider lets it in was checked when it was
+    /// verified.
     ///
     /// # Errors
     ///
@@ -390,8 +419,22 @@ impl PolicyConfig {
         claims: &Map<String, Value>,
         requested: Option<&str>,
         audience: &str,
-    ) -> Result<&ProfileConfig, String> {
-        let matches = |p: &ProfileConfig| p.enabled && p.claims.matches(claims);
+    ) -> Result<(&ProfileConfig, Vec<String>), String> {
+        // The `@id`s of the policies that allowed it, if any did. A `forbid`
+        // that fired is logged: the caller is only told nothing matched.
+        let matches = |p: &ProfileConfig| -> Option<Vec<String>> {
+            if !p.enabled {
+                return None;
+            }
+            let verdict = self.authz.profile(&p.name, claims, &p.audience);
+            if verdict.allowed {
+                return Some(verdict.policies);
+            }
+            if !verdict.policies.is_empty() {
+                warn!(event = "policy.forbid", profile = %p.name, policies = ?verdict.policies);
+            }
+            None
+        };
         let mut profiles = self
             .profiles
             .iter()
@@ -399,9 +442,9 @@ impl PolicyConfig {
 
         if let Some(requested) = requested {
             if let Some(profile) = profiles.find(|p| p.name == requested)
-                && matches(profile)
+                && let Some(policies) = matches(profile)
             {
-                return Ok(profile);
+                return Ok((profile, policies));
             }
             return Err(match self.profiles.iter().find(|p| p.name == requested) {
                 None => format!("unknown profile {requested}"),
@@ -416,12 +459,14 @@ impl PolicyConfig {
             });
         }
 
-        let candidates: Vec<&ProfileConfig> = profiles.filter(|p| matches(p)).collect();
+        let candidates: Vec<(&ProfileConfig, Vec<String>)> = profiles
+            .filter_map(|p| matches(p).map(|policies| (p, policies)))
+            .collect();
         match candidates.as_slice() {
             [] => Err("no profile matches the token".into()),
-            [profile] => Ok(profile),
+            [(profile, policies)] => Ok((*profile, policies.clone())),
             several => {
-                let names: Vec<&str> = several.iter().map(|p| p.name.as_str()).collect();
+                let names: Vec<&str> = several.iter().map(|(p, _)| p.name.as_str()).collect();
                 Err(format!(
                     "profiles {} all match the token: name one",
                     names.join(", ")
@@ -470,8 +515,6 @@ pub struct ProviderConfig {
     /// signs can't pass for one. `None` takes any.
     #[serde(default)]
     pub typ: Option<String>,
-    /// Every token from it must match one of these, whichever profile it gets.
-    pub claims: ClaimRules,
     /// The OAuth client people sign in to it as, for an ID token whose `aud`
     /// is this client: the metadata tells clients such as cf-vault. `None` for
     /// a provider only machines get tokens from, such as GitHub Actions.
@@ -520,46 +563,14 @@ impl ProviderConfig {
         Ok(())
     }
 
-    /// The claims its claim sets and `profile`'s match on, with their values
-    /// in `claims`: what's worth writing down about a caller, and copying into
-    /// the broker's own tokens. Never secret.
-    pub fn matched_claims(
-        &self,
-        profile: Option<&ProfileConfig>,
-        claims: &Map<String, Value>,
-    ) -> Map<String, Value> {
-        /// A string, number or boolean, or a list of them, as claim sets
-        /// match on.
-        fn copyable(value: &Value) -> bool {
-            match value {
-                Value::String(text) => !text.is_empty(),
-                Value::Number(_) | Value::Bool(_) => true,
-                Value::Array(values) => values.iter().all(|v| !v.is_array() && copyable(v)),
-                _ => false,
-            }
-        }
-
-        let profile = profile.map(|p| p.claims.names());
-        self.claims
-            .names()
-            .chain(profile.into_iter().flatten())
-            .filter_map(|name| {
-                let value = claims.get(name).filter(|v| copyable(v))?;
-                Some((name.to_string(), value.clone()))
-            })
-            .collect()
-    }
-
     fn check(&self, at: &str) -> Result<(), String> {
         // Its issuer, jwks_uri and audience are the providers' check.
         check_provider_name(&self.name).map_err(|why| format!("{at}.name {why}"))?;
         if self.typ.as_deref().is_some_and(str::is_empty) {
             return Err(format!("{at}.typ must not be empty"));
         }
-        // Guardrail 1: the provider is pinned. An issuer that gives anyone's
-        // projects a token, as GitHub Actions does, would otherwise let them
-        // all in.
-        self.claims.check(&format!("{at}.claims"))?;
+        // Guardrail 1, that the provider is pinned, is the policy's: it must
+        // admit each provider.
         Ok(())
     }
 }
@@ -581,8 +592,11 @@ pub struct ProfileConfig {
     /// for another service.
     #[serde(default = "ProfileConfig::cloudflare_audience")]
     pub audience: String,
-    /// A token must match one of these, as well as one of its provider's.
-    pub claims: ClaimRules,
+    /// The claims of the caller's token to log and to copy into a token the
+    /// broker signs for another service: what that service may match on, as
+    /// the Cedar policy matched on them. Nothing else is copied.
+    #[serde(default)]
+    pub forward_claims: Vec<String>,
     /// For everything it hands out, the token and the bucket's credentials,
     /// in milliseconds. Taken from the defaults when unset.
     #[serde(default, deserialize_with = "duration")]
@@ -631,6 +645,29 @@ impl ProfileConfig {
         Ok(())
     }
 
+    /// The claims in `claims` that `forward_claims` names: what's worth writing
+    /// down about a caller, and copying into the broker's own tokens. Never
+    /// secret.
+    pub fn forwarded_claims(&self, claims: &Map<String, Value>) -> Map<String, Value> {
+        /// A string, number or boolean, or a list of them.
+        fn copyable(value: &Value) -> bool {
+            match value {
+                Value::String(text) => !text.is_empty(),
+                Value::Number(_) | Value::Bool(_) => true,
+                Value::Array(values) => values.iter().all(|v| !v.is_array() && copyable(v)),
+                _ => false,
+            }
+        }
+
+        self.forward_claims
+            .iter()
+            .filter_map(|name| {
+                let value = claims.get(name).filter(|v| copyable(v))?;
+                Some((name.clone(), value.clone()))
+            })
+            .collect()
+    }
+
     /// The TTL to issue with, in milliseconds: the requested one, clamped to
     /// `max_ttl` rather than refused, or the profile's.
     ///
@@ -649,7 +686,8 @@ impl ProfileConfig {
 
     fn check(&self, at: &str, issuer: &str, account_id: &str) -> Result<(), String> {
         check_profile_name(&self.name).map_err(|why| format!("{at}.name {why}"))?;
-        self.claims.check(&format!("{at}.claims"))?;
+        check_forward_claims(&self.forward_claims)
+            .map_err(|why| format!("{at}.forward_claims {why}"))?;
 
         // Guardrail 5: audiences are kept apart. The broker signs its own
         // token for another service; Cloudflare credentials are another
@@ -1154,6 +1192,38 @@ fn parse_duration(value: &str) -> Option<u64> {
     (total > 0).then_some(total)
 }
 
+/// Names the broker's tokens already have, which a copied claim must not take
+/// the place of.
+const RESERVED_CLAIMS: [&str; 10] = [
+    "iss",
+    "sub",
+    "aud",
+    "exp",
+    "iat",
+    "nbf",
+    "jti",
+    "client_id",
+    "provider",
+    "profile",
+];
+
+/// That `names` are claim names to copy: non-empty, not repeated, and not ones
+/// the broker's tokens set themselves.
+fn check_forward_claims(names: &[String]) -> Result<(), String> {
+    for (index, name) in names.iter().enumerate() {
+        if name.is_empty() {
+            return Err("must not have an empty name".to_string());
+        }
+        if RESERVED_CLAIMS.contains(&name.as_str()) {
+            return Err(format!("can't copy {name}: the broker's tokens set it"));
+        }
+        if names[..index].contains(name) {
+            return Err(format!("names {name} twice"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use serde_json::json;
@@ -1170,26 +1240,57 @@ pub(super) mod tests {
     /// Cloudflare, and one for the cache.
     pub(crate) fn policy() -> Value {
         json!({
-            "version": 3,
+            "version": 4,
             "issuer": BROKER,
-            "providers": [{ "name": "github", "issuer": ISSUER, "audience": BROKER, "claims": [{ "repository_owner_id": "100000001" }] }],
+            "providers": [{ "name": "github", "issuer": ISSUER, "audience": BROKER }],
             "profiles": [
                 {
                     "name": "deploy",
-                    "claims": [{ "repository": "example-org/*", "ref": "refs/heads/main" }],
+                    "forward_claims": ["repository", "ref"],
                     "token": { "policies": [{ "permissions": ["Workers Scripts Write"], "resources": { (format!("com.cloudflare.api.account.{ACCOUNT_ID}")): "*" } }] },
                 },
-                { "name": "nix-push", "audience": CACHE, "claims": [{ "ref": "refs/heads/main" }] },
+                { "name": "nix-push", "audience": CACHE, "forward_claims": ["repository_owner_id", "ref"] },
             ],
         })
     }
 
+    /// Cedar for `policy`: each provider admits its test org, `deploy` and its
+    /// copies take the org's main branch, and every other profile any main.
+    pub(crate) fn cedar(policy: &Value) -> String {
+        let mut text = String::new();
+        let list = |key: &str| policy[key].as_array().cloned().unwrap_or_default();
+        for provider in list("providers") {
+            let Some(name) = provider["name"].as_str() else {
+                continue;
+            };
+            text += &format!(
+                "@id(\"admit-{name}\") permit (principal, action == Admit::Action::\"{name}\", resource) \
+                 when {{ context.repository_owner_id == \"100000001\" }};\n"
+            );
+        }
+        for profile in list("profiles") {
+            let Some(name) = profile["name"].as_str() else {
+                continue;
+            };
+            let rule = if name.starts_with("deploy") {
+                "context.repository like \"example-org/*\" && context.ref == \"refs/heads/main\""
+            } else {
+                "context.ref == \"refs/heads/main\""
+            };
+            text += &format!(
+                "@id(\"allow-{name}\") permit (principal, action == Profile::Action::\"{name}\", resource) when {{ {rule} }};\n"
+            );
+        }
+        text
+    }
+
     pub(crate) fn parse(policy: &Value) -> PolicyConfig {
-        PolicyConfig::parse(&policy.to_string(), ACCOUNT_ID).expect("the policy should parse")
+        PolicyConfig::parse(&policy.to_string(), &cedar(policy), ACCOUNT_ID)
+            .expect("the policy should parse")
     }
 
     fn parse_err(policy: &Value) -> String {
-        PolicyConfig::parse(&policy.to_string(), ACCOUNT_ID).unwrap_err()
+        PolicyConfig::parse(&policy.to_string(), &cedar(policy), ACCOUNT_ID).unwrap_err()
     }
 
     /// The test policy, with `pointer` set to `value`.
@@ -1245,7 +1346,7 @@ pub(super) mod tests {
         assert_eq!((deploy.ttl, deploy.max_ttl), (15 * MINUTE, 2 * HOUR));
 
         let policy = parse(&with_profile(
-            json!({ "name": "short", "claims": [{ "ref": "x" }], "ttl": "90s", "max_ttl": "5m", "token": token() }),
+            json!({ "name": "short" , "ttl": "90s", "max_ttl": "5m", "token": token() }),
         ));
         let short = &policy.profiles[2];
         assert_eq!((short.ttl, short.max_ttl), (90 * SECOND, 5 * MINUTE));
@@ -1257,8 +1358,8 @@ pub(super) mod tests {
 
         let mut both = policy();
         both["providers"].as_array_mut().unwrap().extend([
-            json!({ "name": "access", "issuer": "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc", "client_id": "abc", "claims": [{ "x": "y" }] }),
-            json!({ "name": "okta", "issuer": "https://example.okta.com", "audience": "0oa1", "client_id": "0oa1", "claims": [{ "x": "y" }] }),
+            json!({ "name": "access", "issuer": "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc", "client_id": "abc"  }),
+            json!({ "name": "okta", "issuer": "https://example.okta.com", "audience": "0oa1", "client_id": "0oa1"  }),
         ]);
         both["profiles"][0]["provider"] = json!("github");
         both["profiles"][1]["provider"] = json!("github");
@@ -1287,10 +1388,14 @@ pub(super) mod tests {
 
     #[test]
     fn rejects_bad_policies() {
-        let gitlab = json!({ "name": "gitlab", "issuer": "https://gitlab.com", "audience": BROKER, "claims": [{ "namespace_id": "4000001" }] });
+        let gitlab =
+            json!({ "name": "gitlab", "issuer": "https://gitlab.com", "audience": BROKER });
         let cases = [
-            (json!("not a policy"), "must be a JSON policy"),
-            (with("/version", json!(2)), "version must be 3"),
+            (
+                json!("not a policy"),
+                "config must be TOML, or a JSON object",
+            ),
+            (with("/version", json!(2)), "version must be 4"),
             (with("/extra", json!(1)), "unknown field `extra`"),
             (
                 with("/issuer", json!("https://broker.example.com/x")),
@@ -1324,10 +1429,6 @@ pub(super) mod tests {
             (
                 with("/profiles/0/name", json!("x".repeat(256))),
                 "profiles[0].name must be 1-255",
-            ),
-            (
-                with("/profiles/0/claims", json!([])),
-                "profiles[0].claims must contain at least one claim set",
             ),
             (
                 with("/profiles/0/ttl", json!("forever")),
@@ -1364,10 +1465,6 @@ pub(super) mod tests {
                 "providers[0].name must be 1-64 of [A-Za-z0-9_.-]",
             ),
             (
-                with("/providers/0/claims", json!([])),
-                "providers[0].claims must contain at least one claim set",
-            ),
-            (
                 with("/providers/0/audience", json!("")),
                 "providers[0].audience must not be empty",
             ),
@@ -1382,14 +1479,14 @@ pub(super) mod tests {
             (
                 with(
                     "/providers/-",
-                    json!({ "name": "github", "issuer": "https://gitlab.com", "audience": BROKER, "claims": [{ "x": "y" }] }),
+                    json!({ "name": "github", "issuer": "https://gitlab.com", "audience": BROKER  }),
                 ),
                 "github is named twice",
             ),
             (
                 with(
                     "/providers/-",
-                    json!({ "name": "again", "issuer": ISSUER, "audience": BROKER, "claims": [{ "x": "y" }] }),
+                    json!({ "name": "again", "issuer": ISSUER, "audience": BROKER  }),
                 ),
                 "is configured twice",
             ),
@@ -1522,19 +1619,19 @@ pub(super) mod tests {
     fn keeps_audiences_apart() {
         let cases = [
             (
-                json!({ "name": "nothing", "claims": [{ "ref": "x" }] }),
+                json!({ "name": "nothing"  }),
                 "profiles[2] must have a token, a bucket or both",
             ),
             (
-                json!({ "name": "both", "audience": CACHE, "claims": [{ "ref": "x" }], "token": token() }),
+                json!({ "name": "both", "audience": CACHE , "token": token() }),
                 "a profile for https://cloudflare-nix-api.example.com can't have a token or a bucket",
             ),
             (
-                json!({ "name": "self", "audience": BROKER, "claims": [{ "ref": "x" }] }),
+                json!({ "name": "self", "audience": BROKER  }),
                 "must be another service, not the broker",
             ),
             (
-                json!({ "name": "path", "audience": format!("{CACHE}/x"), "claims": [{ "ref": "x" }] }),
+                json!({ "name": "path", "audience": format!("{CACHE}/x")  }),
                 "must be a bare origin",
             ),
         ];
@@ -1546,7 +1643,7 @@ pub(super) mod tests {
 
     #[test]
     fn checks_the_bucket() {
-        let bucket = |bucket: Value| json!({ "name": "state", "claims": [{ "ref": "x" }], "bucket": bucket });
+        let bucket = |bucket: Value| json!({ "name": "state" , "bucket": bucket });
         let cases = [
             (
                 bucket(json!({ "name": "Org_State", "permission": "object-read-write" })),
@@ -1557,7 +1654,7 @@ pub(super) mod tests {
                 "unknown variant `admin`",
             ),
             (
-                json!({ "name": "state", "claims": [{ "ref": "x" }], "buckets": [{ "name": "org-state", "permission": "object-read-only" }] }),
+                json!({ "name": "state" , "buckets": [{ "name": "org-state", "permission": "object-read-only" }] }),
                 "unknown field `buckets`",
             ),
         ];
@@ -1647,33 +1744,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn rejects_bad_claim_sets() {
-        let cases = [
-            (json!([{}]), "a claim set must match at least one claim"),
-            (
-                json!([{ "repository_id": "2000*" }]),
-                "claim repository_id: ID claims must match exactly",
-            ),
-            (json!([{ "ref": "" }]), "non-empty string"),
-            (json!([{ "ref": null }]), "non-empty string"),
-            (json!([{ "ref": -1 }]), "non-empty string"),
-            (
-                json!([{ "ref": "*" }]),
-                "claim ref: * may only end a pattern",
-            ),
-            (json!([{ "ref": "*main" }]), "may only end a pattern"),
-            (json!([{ "ref": "refs/*/main" }]), "may only end a pattern"),
-            (json!([{ "ref": "refs/**" }]), "may only end a pattern"),
-        ];
-        for (claims, expected) in cases {
-            for pointer in ["/providers/0/claims", "/profiles/0/claims"] {
-                let err = parse_err(&with(pointer, claims.clone()));
-                assert!(err.contains(expected), "{pointer} {claims}: {err}");
-            }
-        }
-    }
-
-    #[test]
     fn picks_the_provider_by_the_tokens_issuer() {
         let policy = parse(&policy());
         assert_eq!(policy.provider_for(&claims()).unwrap().name, "github");
@@ -1695,7 +1765,7 @@ pub(super) mod tests {
     ) -> Result<String, String> {
         parse(policy)
             .profile_for("github", &claims, requested, audience)
-            .map(|profile| profile.name.clone())
+            .map(|(profile, _)| profile.name.clone())
     }
 
     fn ok(name: &str) -> Result<String, String> {
@@ -1785,7 +1855,7 @@ pub(super) mod tests {
     #[test]
     fn never_gives_one_providers_token_anothers_profile() {
         let mut policy = policy();
-        policy["providers"].as_array_mut().unwrap().push(json!({ "name": "gitlab", "issuer": "https://gitlab.com", "audience": "https://cloudflare-sts-api.example.com", "claims": [{ "ref": "refs/heads/main" }] }));
+        policy["providers"].as_array_mut().unwrap().push(json!({ "name": "gitlab", "issuer": "https://gitlab.com", "audience": "https://cloudflare-sts-api.example.com"  }));
         policy["profiles"][0]["provider"] = json!("gitlab");
         policy["profiles"][1]["provider"] = json!("github");
         assert_eq!(
@@ -1840,23 +1910,165 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn knows_a_caller_by_the_claims_the_policy_matches_on() {
-        let policy = parse(&policy());
+    fn knows_a_caller_by_the_claims_its_profile_forwards() {
+        let parsed = parse(&policy());
         let mut claims = claims();
         claims.insert("email".into(), "someone@example.com".into());
-        let provider = &policy.providers[0];
         assert_eq!(
-            Value::Object(provider.matched_claims(Some(&policy.profiles[0]), &claims)),
-            json!({
-                "ref": "refs/heads/main",
-                "repository": "example-org/app",
-                "repository_owner_id": "100000001",
-            })
+            Value::Object(parsed.profiles[0].forwarded_claims(&claims)),
+            json!({ "ref": "refs/heads/main", "repository": "example-org/app" }),
+            "only what it names: the email stays behind"
         );
         assert_eq!(
-            Value::Object(provider.matched_claims(None, &claims)),
-            json!({ "repository_owner_id": "100000001" })
+            Value::Object(parsed.profiles[1].forwarded_claims(&claims)),
+            json!({ "ref": "refs/heads/main", "repository_owner_id": "100000001" })
         );
+        let mut none = policy();
+        none["profiles"][1]["forward_claims"] = json!([]);
+        assert_eq!(
+            parse(&none).profiles[1].forwarded_claims(&claims),
+            Map::new(),
+            "a profile that names none forwards none"
+        );
+        claims.remove("ref");
+        assert_eq!(
+            Value::Object(parsed.profiles[0].forwarded_claims(&claims)),
+            json!({ "repository": "example-org/app" }),
+            "a claim the token doesn't have is left out"
+        );
+    }
+
+    #[test]
+    fn rejects_bad_forward_claims() {
+        let cases = [
+            (json!([""]), "must not have an empty name"),
+            (json!(["ref", "ref"]), "names ref twice"),
+            (json!(["iss"]), "can't copy iss: the broker's tokens set it"),
+            (json!(["profile"]), "can't copy profile"),
+        ];
+        for (names, expected) in cases {
+            let err = parse_err(&with("/profiles/0/forward_claims", names.clone()));
+            assert!(err.contains(expected), "{names}: {err}");
+        }
+    }
+
+    #[test]
+    fn reads_toml_or_json() {
+        let toml = r#"
+            version = 4
+            issuer = "https://cloudflare-sts-api.example.com"
+
+            [[providers]]
+            name = "github"
+            issuer = "https://token.actions.githubusercontent.com"
+            audience = "https://cloudflare-sts-api.example.com"
+
+            [[profiles]]
+            name = "deploy"
+            forward_claims = ["repository"]
+            [[profiles.token.policies]]
+            permissions = ["Workers Scripts Write"]
+            resources = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+        "#;
+        let cedar = r#"
+            @id("a") permit (principal, action == Admit::Action::"github", resource);
+            @id("b") permit (principal, action == Profile::Action::"deploy", resource);
+        "#;
+        let policy = PolicyConfig::parse(toml, cedar, ACCOUNT_ID).unwrap();
+        assert_eq!(policy.profiles[0].forward_claims, ["repository"]);
+        assert_eq!(policy.profiles[0].ttl, 15 * MINUTE);
+
+        let err = PolicyConfig::parse("version = ", cedar, ACCOUNT_ID).unwrap_err();
+        assert!(
+            err.contains("config must be TOML, or a JSON object"),
+            "{err}"
+        );
+        let err = PolicyConfig::parse(
+            &toml.replace("version = 4", "version = 3"),
+            cedar,
+            ACCOUNT_ID,
+        )
+        .unwrap_err();
+        assert_eq!(err, "version must be 4");
+        let err =
+            PolicyConfig::parse(&format!("{toml}\nclaims = []"), cedar, ACCOUNT_ID).unwrap_err();
+        assert!(
+            err.contains("unknown field `claims`"),
+            "a version 3 claims field is refused: {err}"
+        );
+    }
+
+    /// The first fenced block of `lang` in the README.
+    fn readme_block(lang: &str) -> &'static str {
+        let readme = include_str!("../../README.md");
+        let start = readme
+            .find(&format!("```{lang}\n"))
+            .unwrap_or_else(|| panic!("a {lang} block in the README"))
+            + lang.len()
+            + 4;
+        &readme[start..start + readme[start..].find("```").unwrap()]
+    }
+
+    #[test]
+    fn loads_the_readmes_example() {
+        let policy = PolicyConfig::parse(readme_block("toml"), readme_block("cedar"), ACCOUNT_ID)
+            .expect("the README's example policy should load");
+        assert_eq!(policy.providers.len(), 3);
+        assert_eq!(policy.profiles.len(), 5);
+
+        // And it does what it says: the apply job, from main, in prod.
+        let mut claims = claims();
+        claims.insert("repository_id".into(), "200000002".into());
+        claims.insert("environment".into(), "prod".into());
+        let (profile, policies) = policy
+            .profile_for(
+                "com.github.actions",
+                &claims,
+                Some("example-org/infra:ci.apply"),
+                CLOUDFLARE_AUDIENCE,
+            )
+            .unwrap();
+        assert_eq!(profile.name, "example-org/infra:ci.apply");
+        assert_eq!(policies, ["apply-from-main"]);
+        assert!(policy.admit("com.github.actions", &claims).allowed);
+
+        claims.insert("event_name".into(), "pull_request_target".into());
+        let forbidden = policy.admit("com.github.actions", &claims);
+        assert!(!forbidden.allowed, "a forbid beats the permit");
+        assert_eq!(forbidden.policies, ["no-pull-request-target"]);
+    }
+
+    #[test]
+    fn refuses_a_policy_that_doesnt_fit_the_configuration() {
+        let config = policy();
+        let ok = cedar(&config);
+        let parse =
+            |cedar: &str| PolicyConfig::parse(&config.to_string(), cedar, ACCOUNT_ID).unwrap_err();
+
+        let without = ok
+            .replace("admit-github", "other")
+            .replace("Admit::Action::\"github\"", "Admit::Action::\"gitlab\"");
+        assert!(
+            parse(&without).contains("names no provider"),
+            "{}",
+            parse(&without)
+        );
+        let only_profiles: String = ok
+            .lines()
+            .filter(|l| !l.contains("Admit"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            parse(&only_profiles).contains("provider github has no policy admitting it"),
+            "a provider that nothing pins is refused: {}",
+            parse(&only_profiles)
+        );
+        let no_deploy: String = ok
+            .lines()
+            .filter(|l| !l.contains("allow-deploy"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(parse(&no_deploy).contains("profile deploy has no policy allowing anyone"));
     }
 
     #[test]

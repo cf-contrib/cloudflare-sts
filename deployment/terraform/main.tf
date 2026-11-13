@@ -27,12 +27,13 @@ resource "cloudflare_worker" "this" {
 }
 
 locals {
-  # The policy, as the broker reads it from the policy key of its KV namespace. The
+  # The configuration, as the broker reads it from the config key of its KV
+  # namespace (JSON is TOML's equal there; Terraform has no TOML encoder). The
   # module fills in what the deployment decides, and leaves out what's unset:
   # the broker takes a missing field, not a null one.
   policy = merge(
     {
-      version = 3
+      version = 4
       issuer  = local.broker_url
       providers = [
         for provider in var.oidc_providers : {
@@ -45,22 +46,30 @@ locals {
     { for key, value in { defaults = local.defaults } : key => value if length(value) > 0 },
   )
   defaults    = { for key, value in var.defaults : key => value if value != null }
-  policy_json = jsonencode(local.policy)
+  config_json = jsonencode(local.policy)
 }
 
 # The policy lives in Workers KV, not in a Worker variable (5 KB at most), so it
-# can be as long as it needs to be. The Worker reads it on a miss and holds it
-# for a minute: a change takes effect within about two, with no new version.
+# can be as long as it needs to be: the configuration under `config`, the Cedar
+# policy under `policy`. The Worker reads them on a miss and holds them for a
+# minute: a change takes effect within about two, with no new version.
 resource "cloudflare_workers_kv_namespace" "policy" {
   account_id = var.account_id
   title      = "${var.worker_name}-policy"
+}
+
+resource "cloudflare_workers_kv" "config" {
+  account_id   = var.account_id
+  namespace_id = cloudflare_workers_kv_namespace.policy.id
+  key_name     = "config"
+  value        = local.config_json
 }
 
 resource "cloudflare_workers_kv" "policy" {
   account_id   = var.account_id
   namespace_id = cloudflare_workers_kv_namespace.policy.id
   key_name     = "policy"
-  value        = local.policy_json
+  value        = var.cedar_policy
 }
 
 # Upload a new version on every artifact or binding change.
@@ -126,7 +135,7 @@ resource "cloudflare_workers_deployment" "this" {
   strategy    = "percentage"
 
   # The policy is there before the first request: without it every one is a 500.
-  depends_on = [cloudflare_workers_kv.policy]
+  depends_on = [cloudflare_workers_kv.config, cloudflare_workers_kv.policy]
 
   versions = [
     {

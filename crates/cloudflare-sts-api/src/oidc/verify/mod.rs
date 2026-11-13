@@ -11,7 +11,6 @@
 
 mod keys;
 mod metadata;
-mod policy;
 
 use std::{
     cell::RefCell,
@@ -24,7 +23,7 @@ use sha2::{Digest, Sha256};
 use worker::Date;
 
 use self::keys::RsaKey;
-pub use self::{keys::check_url, policy::ClaimRules};
+pub use self::keys::check_url;
 use crate::oidc::{
     Claims, Error, Header, Jwt,
     error::invalid,
