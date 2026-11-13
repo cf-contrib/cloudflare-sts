@@ -11,7 +11,7 @@ pub enum Error {
     /// another audience, expired, or from an issuer no provider is for.
     InvalidToken(String),
     /// `insufficient_scope`: a valid token none of the
-    /// [`ClaimRules`](crate::ClaimRules) matches. Which would have isn't
+    /// [`ClaimRules`](crate::oidc::ClaimRules) matches. Which would have isn't
     /// said: that's the configuration, not the caller's to probe.
     InsufficientScope {
         /// The token's `iss`.

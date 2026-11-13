@@ -6,7 +6,7 @@ use std::ops::Deref;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::{Error, error::invalid};
+use crate::oidc::{Error, error::invalid};
 
 /// Clock tolerance for `exp` and `nbf`.
 pub(crate) const LEEWAY_SECS: u64 = 60;
@@ -173,7 +173,7 @@ impl From<Claims> for Map<String, Value> {
 
 /// The claims of a JWT access token (RFC 9068 §2.2): the ones it requires,
 /// so a token without them can't be signed, and any others.
-/// [`SigningKey::sign_access_token`](crate::SigningKey::sign_access_token)
+/// [`SigningKey::sign_access_token`](crate::oidc::SigningKey::sign_access_token)
 /// signs them, and gives them their `jti`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AccessTokenClaims {

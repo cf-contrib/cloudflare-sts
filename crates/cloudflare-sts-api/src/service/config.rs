@@ -24,10 +24,11 @@ use cloudflare::v4::{
     IamResourcesTypeObjectNested, IamResourcesTypeObjectNestedAdditionalProperty,
     IamResourcesTypeObjectString,
 };
-use cloudflare_sts_core::{ClaimRules, Provider, Providers, check_url};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use worker::{Env, Error, SecretStore, js_sys, wasm_bindgen::JsValue};
+
+use crate::oidc::{ClaimRules, Provider, Providers, check_url};
 
 /// The binding of the account the Cloudflare token belongs to, and tokens are
 /// minted in.

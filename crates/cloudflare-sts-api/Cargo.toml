@@ -13,8 +13,11 @@ worker = { version = "0.8", features = ["http", "axum"] }
 
 # The API: its types, and the traits and router the Worker implements.
 cloudflare-sts-sdk = { path = "../cloudflare-sts-sdk", features = ["server"] }
-# Verifies the OIDC tokens exchanges present, and signs the broker's own.
-cloudflare-sts-core = { path = "../cloudflare-sts-core" }
+# The OIDC tokens exchanges present, verified, and the broker's own, signed (src/oidc), with RS256
+# through the runtime's WebCrypto.
+base64 = "0.23"
+sha2 = { version = "0.11", default-features = false }
+web-sys = { version = "0.3", features = ["AbortSignal", "Crypto", "CryptoKey", "SubtleCrypto", "WorkerGlobalScope"] }
 # Named by the generated traits and router; the versions the SDK builds with.
 async-trait = "0.1"
 axum = { version = "0.8", default-features = false, features = ["json"] }
@@ -50,7 +53,6 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync",
 # Signs the stand-in issuers' tokens and verifies the broker's, with keys made
 # from fixed seeds. Only in the tests: the Worker signs with WebCrypto.
 rand_chacha = "0.3"
-base64 = "0.23"
 rsa = { version = "0.9", features = ["sha2"] }
 
 [features]

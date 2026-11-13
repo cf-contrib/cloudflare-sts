@@ -13,7 +13,7 @@ use worker::{
     wasm_bindgen::{JsCast, JsValue},
 };
 
-use crate::{ALGORITHM, AT_JWT, AccessTokenClaims, Claims, JWT, KeyError, crypto};
+use crate::oidc::{ALGORITHM, AT_JWT, AccessTokenClaims, Claims, KeyError, crypto};
 
 /// The smallest RSA key accepted, as NIST requires.
 const MIN_MODULUS_BITS: usize = 2048;
@@ -94,24 +94,9 @@ impl SigningKey {
         })
     }
 
-    /// The key's ID: its public key's RFC 7638 thumbprint, SHA-256 and
-    /// base64url, so a new key gets a new one without any configuration.
-    pub fn kid(&self) -> &str {
-        &self.kid
-    }
-
     /// The public half, as a JWKS publishes it.
     pub fn public_jwk(&self) -> Value {
         json!({ "kty": "RSA", "n": self.n, "e": self.e, "kid": self.kid, "alg": ALGORITHM, "use": "sig" })
-    }
-
-    /// Signs `claims` as a JWT (`typ` `JWT`), with a fresh random `jti`.
-    ///
-    /// # Errors
-    ///
-    /// When WebCrypto fails.
-    pub async fn sign(&self, claims: Claims) -> Result<SignedToken, KeyError> {
-        self.sign_typed(JWT, claims).await
     }
 
     /// Signs `claims` as a JWT access token (RFC 9068): `typ` `at+jwt`, so a

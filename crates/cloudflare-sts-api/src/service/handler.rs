@@ -34,7 +34,6 @@ use cloudflare::v4::{
     ApiOpError, HttpClient, IamCreatePayload, IamTokenStatus, R2TempAccessCredsRequest,
     R2TempAccessCredsRequestPermission,
 };
-use cloudflare_sts_core::{AccessTokenClaims, Jwt, SigningKey};
 use cloudflare_sts_sdk::v1::{
     self, AuthorizationServerMetadata, BucketCredentials, DiscoveryServiceApi, Error, ErrorCode,
     IdentityProvider, IssuedTokenType, Jwks, OpenIdProviderMetadata, TokenExchangeRequest,
@@ -46,6 +45,7 @@ use tracing::{error, info, warn};
 use worker::{Date, send::SendFuture};
 
 use super::config::{BucketPermission, CLOUDFLARE_AUDIENCE, Config, ProfileConfig, ProviderConfig};
+use crate::oidc::{self, AccessTokenClaims, Jwt, SigningKey};
 
 /// The token exchange grant, RFC 8693's.
 pub(super) const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -461,7 +461,7 @@ impl TokenServiceApi for TokenServiceHandler {
                 // isn't valid, or that the policy doesn't take, is
                 // invalid_request (RFC 8693 §2.2.2).
                 let invalid_request = |why: &str| Error::new(ErrorCode::InvalidRequest, why);
-                let identity = cloudflare_sts_core::verified(&request.subject_token)
+                let identity = oidc::verified(&request.subject_token)
                     .ok_or_else(|| invalid_request("the subject token wasn't verified"))?;
                 let provider = policy
                     .provider_for(&identity.claims)
@@ -841,7 +841,7 @@ mod tests {
 
     fn identity(claims: Map<String, Value>) -> Jwt {
         Jwt {
-            header: cloudflare_sts_core::Header::default(),
+            header: oidc::Header::default(),
             claims: claims.into(),
         }
     }
@@ -883,7 +883,7 @@ mod tests {
         .unwrap();
         assert_eq!(expires_at, NOW + 300, "never past the caller's own token");
         assert_eq!(
-            Value::Object(cloudflare_sts_core::Claims::from(issued).into_inner()),
+            Value::Object(oidc::Claims::from(issued).into_inner()),
             json!({
                 "ref": "refs/heads/main",
                 "repository_owner_id": "100000001",

@@ -24,11 +24,8 @@ use sha2::{Digest, Sha256};
 use worker::Date;
 
 use self::keys::RsaKey;
-pub use self::{
-    keys::check_url,
-    policy::{ClaimRule, ClaimRules},
-};
-use crate::{
+pub use self::{keys::check_url, policy::ClaimRules};
+use crate::oidc::{
     Claims, Error, Header, Jwt,
     error::invalid,
     jwt::{LEEWAY_SECS, Unverified},
@@ -57,7 +54,7 @@ pub trait Provider {
     }
 
     /// The `typ` its tokens must have (RFC 8725 §3.11), such as
-    /// [`AT_JWT`](crate::AT_JWT), so another kind of token it issues can't
+    /// [`AT_JWT`](crate::oidc::AT_JWT), so another kind of token it issues can't
     /// pass for one. `None`, the default, takes any.
     fn typ(&self) -> Option<&str> {
         None
@@ -223,7 +220,7 @@ fn store(token: &str, jwt: Jwt, expires_at: u64, now_ms: u64) {
     VERIFIED.with_borrow_mut(|cache| cache.insert(key, jwt, expires_at, now_ms));
 }
 
-/// `token`, if [`Providers::verify`](crate::Providers::verify) accepted it in
+/// `token`, if [`Providers::verify`](crate::oidc::Providers::verify) accepted it in
 /// this isolate and it hasn't expired since.
 pub fn verified(token: &str) -> Option<Jwt> {
     cached(token, Date::now().as_millis())
@@ -274,7 +271,7 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::*;
-    use crate::ALGORITHM;
+    use crate::oidc::ALGORITHM;
 
     const ISSUER: &str = "https://token.actions.githubusercontent.com";
     const AUDIENCE: &str = "https://cloudflare-sts-api.example.com";

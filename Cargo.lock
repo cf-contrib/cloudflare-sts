@@ -300,7 +300,6 @@ dependencies = [
  "base64",
  "chrono",
  "cloudflare",
- "cloudflare-sts-core",
  "cloudflare-sts-sdk",
  "rand_chacha",
  "reqwest",
@@ -308,23 +307,13 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2 0.11.1",
  "tokio",
  "tower-layer",
  "tower-service",
  "tracing",
  "tracing-subscriber",
  "tracing-web",
- "worker",
-]
-
-[[package]]
-name = "cloudflare-sts-core"
-version = "0.8.0"
-dependencies = [
- "base64",
- "serde",
- "serde_json",
- "sha2 0.11.1",
  "web-sys",
  "worker",
 ]

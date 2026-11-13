@@ -6,11 +6,8 @@ use serde::Deserialize;
 /// What tokens are signed with, and what OIDC verifiers support by default.
 pub const ALGORITHM: &str = "RS256";
 
-/// The `typ` of a JWT (RFC 7519 §5.1).
-pub const JWT: &str = "JWT";
-
 /// The `typ` of a JWT access token (RFC 9068 §2.1): what a resource server
-/// names as its [`Provider::typ`](crate::Provider::typ) to take nothing else.
+/// names as its [`Provider::typ`](crate::oidc::Provider::typ) to take nothing else.
 pub const AT_JWT: &str = "at+jwt";
 
 /// The JOSE Header parameters (RFC 7515 §4.1) a JWT is verified by.
