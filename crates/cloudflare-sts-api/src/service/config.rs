@@ -410,7 +410,7 @@ pub struct ProviderConfig {
     /// Every token from it must match one of these, whichever profile it gets.
     pub claims: ClaimRules,
     /// The OAuth client people sign in to it as, for an ID token whose `aud`
-    /// is this client: the metadata tells clients such as the CLI. `None` for
+    /// is this client: the metadata tells clients such as cf-vault. `None` for
     /// a provider only machines get tokens from, such as GitHub Actions.
     #[serde(default)]
     pub client_id: Option<String>,

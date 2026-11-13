@@ -32,12 +32,13 @@ steps:
 |---|---|---|
 | [`action`](action) | `uses: cf-contrib/cloudflare-sts@<version>` | The GitHub Action, in JavaScript with no runtime dependencies. Gets the job's OIDC token, exports the minted Cloudflare token, and revokes it at job end. |
 | [`crates/cloudflare-sts-api`](crates/cloudflare-sts-api) | `index.js` + `index_bg.wasm.base64` in [Releases](https://github.com/cf-contrib/cloudflare-sts/releases) | The broker, a Cloudflare Worker written in Rust, in your account. Checks the OIDC token against your policy, and mints the Cloudflare token or R2 credentials, or signs a token for another service. |
-| [`crates/cloudflare-sts-cli`](crates/cloudflare-sts-cli) | `nix profile install github:cf-contrib/cloudflare-sts` | The CLI, for people: `cloudflare-sts login`, then `cloudflare-sts exec --profile <profile> -- <command>` runs a command with the same environment the action sets, and revokes the token when it exits. |
 | [`crates/cloudflare-sts-sdk`](crates/cloudflare-sts-sdk) | A Rust crate in this workspace; not published | The broker's HTTP API: its [TypeSpec](crates/cloudflare-sts-sdk/openapi/sts/v1/stsv1.tsp), the OpenAPI document compiled from it, and the types, server traits and client generated from it; hand-written beside them, the health endpoints. The Worker builds on it. |
 | [`crates/cloudflare-sts-core`](crates/cloudflare-sts-core) | A Rust crate in this workspace; not published | OIDC tokens in Workers, verified and signed. The Worker builds on it, and cloudflare-nix can too. |
 | [`deployment/terraform`](deployment/terraform) | `//deployment/terraform?ref=<version>` | Deploys the released Worker with your policy, its bindings and its cron. |
 
 The action and the broker, with its Terraform module, are released together from one tag, so deploy the broker from the release whose action you use. The action talks only to the broker, never to the Cloudflare API.
+
+People on their own machines use [cf-vault](https://github.com/cf-contrib/cf-vault): it signs in through your identity provider, trades the ID token at this broker, runs a command with the credentials and revokes the token when it exits. This repository no longer ships a command-line client.
 
 The broker takes OIDC tokens from any issuer you list: GitHub Actions, GitLab CI, HCP Terraform, or, for people, an identity provider such as [Cloudflare Access](crates/cloudflare-sts-api#people). Who gets what is in the policy's claim sets, the same rules [cloudflare-nix](https://github.com/cf-contrib/cloudflare-nix) uses.
 
@@ -97,7 +98,6 @@ Everything runs inside the dev shell: `nix develop`, or the Dev Container.
 (cd crates/cloudflare-sts-sdk/openapi && npm ci && npm run generate)   # the OpenAPI document, after editing the .tsp
 cargo fmt --all --check && cargo test                                    # the crates' unit tests
 crates/cloudflare-sts-api/tests/run.sh                                 # the broker end to end, under wrangler dev
-nix build .#default                                            # the CLI, as people install it
 (cd deployment/terraform && tofu test)                                   # the Terraform module
 ```
 
