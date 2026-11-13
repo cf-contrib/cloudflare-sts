@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.22.0](https://github.com/cf-contrib/cloudflare-sts/compare/v0.21.1...v0.22.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* version 3 policies are refused. Split them into config.toml and policy.cedar; the Terraform module's providers and profiles lose `claims` and it takes a `cedar_policy`. See Migration from version 3.
+* CLOUDFLARE_STS_API_POLICY is no longer read; a Worker that still has it is refused. Upgrade the Terraform module. A policy change now takes about two minutes and doesn't roll back with the Worker.
+
+### Features
+
+* read the policy from Workers KV, not a Worker variable ([#125](https://github.com/cf-contrib/cloudflare-sts/issues/125)) ([2911688](https://github.com/cf-contrib/cloudflare-sts/commit/2911688daa5d8d75755f2b25d1c2f30d78c3be20))
+* TOML configuration and a Cedar policy, in place of claim sets ([#126](https://github.com/cf-contrib/cloudflare-sts/issues/126)) ([826f9f8](https://github.com/cf-contrib/cloudflare-sts/commit/826f9f8056e985171b198992f7a89a78d74acc64))
+
 ## [0.21.1](https://github.com/cf-contrib/cloudflare-sts/compare/v0.21.0...v0.21.1) (2026-11-09)
 
 
