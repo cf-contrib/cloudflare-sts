@@ -1,13 +1,19 @@
 //! The Worker's configuration, read from its bindings.
 //!
-//! [`Config::from_env`] is the only place that reads `Env`: the crate root
+//! [`Config::load`] is the only place that reads `Env`: the crate root
 //! builds one per request and hands it to the handler and the auth layer,
 //! which take what they need from it.
 //!
-//! An unset account, an invalid policy, or a Cloudflare token that isn't a
-//! Secrets Store binding fails it, and the Worker serves nothing until it's
-//! fixed. The secrets' values are read only when they're used, since reading
-//! them is async, so a rotated one takes effect on the next request.
+//! The policy is read from Workers KV and held by the isolate for
+//! [`POLICY_TTL`], so a change takes effect within about that long, plus KV's
+//! own edge caching. It fails closed: once the held policy has expired, a KV
+//! that can't be read, or a policy that's missing or invalid, fails every
+//! request; an expired policy is never served.
+//!
+//! An unset account, an unreadable or invalid policy, or a Cloudflare token
+//! that isn't a Secrets Store binding fails it, and the Worker serves nothing
+//! until it's fixed. The secrets' values are read only when they're used, so a
+//! rotated one takes effect on the next request.
 //!
 //! The policy's format is here too: [`PolicyConfig`], its providers and
 //! profiles, their claim sets and bucket prefixes, and what parsing checks,
@@ -15,7 +21,7 @@
 //! [`layer`](super::layer); what a caller gets, in the
 //! [`handler`](super::handler).
 
-use std::collections::BTreeMap;
+use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 
 use cloudflare::v4::{
     HttpClient, IamEffect, IamPermissionGroup,
@@ -34,8 +40,18 @@ use crate::oidc::{ClaimRules, Provider, Providers, check_url};
 /// minted in.
 const ACCOUNT_KEY: &str = "CLOUDFLARE_STS_API_ACCOUNT_ID";
 
-/// The binding of the policy, as JSON.
-const POLICY_KEY: &str = "CLOUDFLARE_STS_API_POLICY";
+/// The Workers KV binding the policy is read from.
+const POLICY_BINDING: &str = "CLOUDFLARE_STS_API_POLICY_KV";
+
+/// The key in that namespace holding the policy, as JSON.
+const POLICY_KEY: &str = "policy";
+
+/// Where the policy was before it moved to KV: a plain-text variable. Still
+/// set, it's refused with where it went, not ignored.
+const OLD_POLICY_VAR: &str = "CLOUDFLARE_STS_API_POLICY";
+
+/// How long an isolate keeps the policy it parsed before reading it again.
+const POLICY_TTL: f64 = 60_000.0;
 
 /// The binding of the Cloudflare token: account-owned, with "Account API Tokens
 /// Write", plus R2 permissions covering what profiles' buckets delegate.
@@ -71,8 +87,8 @@ const DEFAULT_MAX_TTL: u64 = HOUR;
 
 /// What the Worker is configured with, from its bindings.
 pub struct Config {
-    /// `CLOUDFLARE_STS_API_POLICY`, checked against the account.
-    policy: PolicyConfig,
+    /// The policy in KV, checked against the account.
+    policy: Arc<PolicyConfig>,
     /// The account tokens are minted in, and its API.
     cloudflare: CloudflareConfig,
     /// `CLOUDFLARE_STS_API_SIGNING_KEY`'s binding. None issues no tokens of
@@ -81,20 +97,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// Reads the Worker's bindings.
+    /// Reads the Worker's bindings, and the policy from KV unless this
+    /// isolate has one that hasn't expired.
     ///
     /// # Errors
     ///
     /// When the account isn't set, a secret isn't a Secrets Store binding, or
-    /// the policy is invalid.
-    pub fn from_env(env: &Env) -> worker::Result<Self> {
+    /// the policy can't be read from KV or is invalid.
+    pub async fn load(env: &Env) -> worker::Result<Self> {
         let cloudflare = CloudflareConfig::from_env(env)?;
-        let policy = env
-            .var(POLICY_KEY)
-            .map(|var| var.to_string())
-            .unwrap_or_default();
-        let policy = PolicyConfig::parse(&policy, cloudflare.account_id())
-            .map_err(|why| Error::RustError(format!("{POLICY_KEY}: {why}")))?;
+        let policy = load_policy(env, cloudflare.account_id()).await?;
         Ok(Self {
             policy,
             cloudflare,
@@ -119,6 +131,56 @@ impl Config {
             None => Ok(None),
         }
     }
+}
+
+thread_local! {
+    /// The last policy this isolate parsed, and when it expires (ms since the
+    /// epoch). Only a valid policy is kept.
+    static POLICY: RefCell<Option<(f64, Arc<PolicyConfig>)>> = const { RefCell::new(None) };
+}
+
+/// The policy: the isolate's, if it hasn't expired, else read from KV and
+/// parsed. A failed read or parse leaves nothing held and fails the request.
+async fn load_policy(env: &Env, account_id: &str) -> worker::Result<Arc<PolicyConfig>> {
+    let now = js_sys::Date::now();
+    let held = POLICY.with(|held| {
+        held.borrow()
+            .as_ref()
+            .filter(|(expires, _)| *expires > now)
+            .map(|(_, policy)| policy.clone())
+    });
+    if let Some(policy) = held {
+        return Ok(policy);
+    }
+    POLICY.with(|held| held.borrow_mut().take());
+
+    let moved = js_sys::Reflect::get(env.as_ref(), &JsValue::from_str(OLD_POLICY_VAR))
+        .is_ok_and(|binding| !binding.is_undefined());
+    if moved {
+        return Err(Error::RustError(format!(
+            "{OLD_POLICY_VAR} is no longer read: the policy is key `{POLICY_KEY}` in the Workers KV binding {POLICY_BINDING}"
+        )));
+    }
+    let kv = env.kv(POLICY_BINDING).map_err(|why| {
+        Error::RustError(format!(
+            "{POLICY_BINDING} must be a Workers KV binding: {why}"
+        ))
+    })?;
+    let json = kv
+        .get(POLICY_KEY)
+        .text()
+        .await
+        .map_err(|why| {
+            Error::RustError(format!(
+                "{POLICY_BINDING}: `{POLICY_KEY}` can't be read: {why}"
+            ))
+        })?
+        .ok_or_else(|| Error::RustError(format!("{POLICY_BINDING}: `{POLICY_KEY}` isn't set")))?;
+    let policy = PolicyConfig::parse(&json, account_id)
+        .map(Arc::new)
+        .map_err(|why| Error::RustError(format!("{POLICY_BINDING}: {why}")))?;
+    POLICY.with(|held| *held.borrow_mut() = Some((now + POLICY_TTL, policy.clone())));
+    Ok(policy)
 }
 
 /// The Cloudflare account tokens are minted in, and how to reach its API.

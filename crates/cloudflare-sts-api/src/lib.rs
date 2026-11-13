@@ -2,7 +2,8 @@
 //! for short-lived Cloudflare credentials, or its own tokens for other
 //! services.
 //!
-//! Each request reads the Worker's configuration from its bindings, then
+//! Each request reads the Worker's configuration from its bindings, and the
+//! policy from Workers KV unless the isolate holds one from the last minute, then
 //! serves the SDK's routers over it: the token endpoints, with the auth layer
 //! authenticating every exchange before its handler; the discovery endpoints,
 //! cached publicly; and the health endpoints beside them, ready only while
@@ -53,7 +54,7 @@ fn start() {
 
 #[event(fetch)]
 async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse> {
-    let mut router = match Config::from_env(&env) {
+    let mut router = match Config::load(&env).await {
         // Each router checks its requests against the spec, form bodies
         // included, before they reach a handler; the auth layer
         // authenticates every exchange first.
@@ -93,7 +94,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
 /// The hourly cleanup of expired `cloudflare-sts:` tokens.
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    let deleted = match Config::from_env(&env) {
+    let deleted = match Config::load(&env).await {
         Ok(config) => TokenServiceHandler::new(Arc::new(config)).cleanup().await,
         Err(err) => Err(v1::Error::new(ErrorCode::ServerError, err.to_string())),
     };

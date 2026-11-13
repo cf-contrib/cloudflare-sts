@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Runs the integration tests: creates the test secrets in a local Secrets Store,
+# and the policy in a local KV namespace,
 # starts the Worker as wrangler.toml has it under `wrangler dev`, runs the tests
 # against it, and stops it. All keys and tokens are made up and thrown away
 # afterwards.
@@ -20,6 +21,9 @@ secret() {
 }
 secret cloudflare-token test-cloudflare-token
 secret signing-key "$(cat "$KEYS/signing.pem")"
+
+# The policy: a KV key, as in a deployment. The Worker holds it for a minute.
+wrangler kv key put policy --path tests/policy.json --binding CLOUDFLARE_STS_API_POLICY_KV --local --persist-to "$PERSIST" >/dev/null
 
 wrangler dev --persist-to "$PERSIST" --test-scheduled >"$LOG" 2>&1 &
 DEV=$!

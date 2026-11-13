@@ -1,0 +1,43 @@
+{
+  "version": 3,
+  "issuer": "http://127.0.0.1:8790",
+  "providers": [
+    { "name": "github", "issuer": "http://127.0.0.1:8791/issuers/actions", "audience": "http://127.0.0.1:8790", "claims": [{ "repository_owner_id": "100000001" }] },
+    { "name": "gitlab", "issuer": "http://127.0.0.1:8791/issuers/gitlab", "audience": "http://127.0.0.1:8790", "claims": [{ "namespace_id": "4000001" }] },
+    { "name": "mismatched", "issuer": "http://127.0.0.1:8791/issuers/mismatched", "audience": "http://127.0.0.1:8790", "claims": [{ "namespace_id": "4000001" }] },
+    { "name": "pinned", "issuer": "http://127.0.0.1:8791/issuers/pinned", "audience": "http://127.0.0.1:8790", "jwks_uri": "http://127.0.0.1:8791/issuers/pinned/.well-known/jwks", "claims": [{ "namespace_id": "4000001" }] },
+    { "name": "typed", "issuer": "http://127.0.0.1:8791/issuers/typed", "audience": "http://127.0.0.1:8790", "typ": "at+jwt", "claims": [{ "namespace_id": "4000001" }] },
+    { "name": "access", "issuer": "http://127.0.0.1:8791/issuers/access", "client_id": "test-access-client-id", "claims": [{ "iss": "http://127.0.0.1:8791/issuers/access" }] }
+  ],
+  "defaults": { "ttl": "15m", "max_ttl": "1h" },
+  "profiles": [
+    { "name": "example-org/infra:ci.apply", "provider": "github", "claims": [{ "repository_id": "200000002", "ref": "refs/heads/main", "environment": "prod" }],
+      "token": { "policies": [{ "permissions": ["Zone Write", "DNS Write"], "resources": { "com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210": "*" } }] } },
+    { "name": "workers-deploy", "provider": "github", "claims": [{ "repository": "example-org/*", "ref": "refs/heads/main", "environment": "prod" }],
+      "token": { "policies": [{ "permissions": ["Workers Scripts Write"], "resources": { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef": "*" } }] } },
+    { "name": "misspelled", "provider": "github", "claims": [{ "environment": "misspelled" }],
+      "token": { "policies": [{ "permissions": ["Workers Scrpts Write"], "resources": { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef": "*" } }] } },
+    { "name": "lb-account", "provider": "github", "claims": [{ "environment": "lb-account" }],
+      "token": { "policies": [{ "permissions": ["Load Balancers Write"], "resources": { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef": "*" } }] } },
+    { "name": "lb-zone", "provider": "github", "claims": [{ "environment": "lb-zone" }],
+      "token": { "policies": [{ "permissions": ["Load Balancers Write"], "resources": { "com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210": "*" } }] } },
+    { "name": "terraform-state", "provider": "github", "claims": [{ "repository": "example-org/state-*", "environment": "state" }],
+      "bucket": { "name": "org-terraform-state", "permission": "object-read-write", "prefixes": ["github.com/{repository}/"] } },
+    { "name": "whole-bucket", "provider": "github", "claims": [{ "environment": "whole-bucket" }], "max_ttl": "30m",
+      "bucket": { "name": "org-terraform-state", "permission": "object-read-only" } },
+    { "name": "state-and-deploy", "provider": "github", "claims": [{ "environment": "state-and-deploy" }], "ttl": "10m",
+      "token": { "policies": [{ "permissions": ["Workers Scripts Write"], "resources": { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef": "*" } }] },
+      "bucket": { "name": "org-terraform-state", "permission": "object-read-write", "prefixes": ["{repository_id}/"] } },
+    { "name": "owner-state", "provider": "github", "claims": [{ "environment": "owner-state" }],
+      "bucket": { "name": "org-terraform-state", "permission": "object-read-write", "prefixes": ["{repository_owner}/"] } },
+    { "name": "nix-push", "provider": "github", "audience": "https://cloudflare-nix-api.example.com", "claims": [{ "ref": "refs/heads/main" }] },
+    { "name": "gitlab-deploy", "provider": "gitlab", "claims": [{ "project_path": "group/app", "ref_protected": "true" }],
+      "token": { "policies": [{ "permissions": ["Workers Scripts Write"], "resources": { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef": "*" } }] } },
+    { "name": "gitlab-cache", "provider": "gitlab", "audience": "https://cloudflare-nix-api.example.com", "claims": [{ "project_path": "group/*" }] },
+    { "name": "gitlab-state", "provider": "gitlab", "claims": [{ "project_path": "group/sub/*" }],
+      "bucket": { "name": "org-terraform-state", "permission": "object-read-write", "prefixes": ["gitlab.com/{project_path}/", "{namespace_id}/{project_id}/"] } },
+    { "name": "pinned-cache", "provider": "pinned", "audience": "https://cloudflare-nix-api.example.com", "claims": [{ "namespace_id": "4000001" }] },
+    { "name": "example-org/app:tofu-plan", "provider": "access", "claims": [{ "email": "alice@example.com" }],
+      "bucket": { "name": "org-terraform-state", "permission": "object-read-only", "prefixes": ["github.com/example-org/app/"] } }
+  ]
+}

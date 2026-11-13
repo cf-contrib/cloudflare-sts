@@ -52,7 +52,7 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
    gh api orgs/<org> --jq .id           # the GitHub Actions provider's repository_owner_id
    gh api repos/<org>/<repo> --jq .id   # a profile's repository_id
    ```
-3. **Deploy** the released Worker with the [Terraform module](../../deployment/terraform) (`//deployment/terraform?ref=<version>`). It downloads the release (optionally pinned to a checksum), binds your policy to it, and sets up the bindings, the workers.dev URL (or an optional custom domain) and the cron. To deploy a build of your own, build it and point the module's `worker_dir` at it:
+3. **Deploy** the released Worker with the [Terraform module](../../deployment/terraform) (`//deployment/terraform?ref=<version>`). It downloads the release (optionally pinned to a checksum), stores your policy in a Workers KV namespace bound to it, and sets up the other bindings, the workers.dev URL (or an optional custom domain) and the cron. To deploy a build of your own, build it and point the module's `worker_dir` at it:
    ```sh
    worker-build --release   # then worker_dir = ".../crates/cloudflare-sts-api/build"
    ```
@@ -63,21 +63,38 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
 | Binding | Type | Required | Description |
 |---|---|---|---|
 | `CLOUDFLARE_STS_API_ACCOUNT_ID` | plain text | yes | Account the Cloudflare token belongs to and tokens are minted in. |
-| `CLOUDFLARE_STS_API_POLICY` | plain text | yes | The [policy](#policy), as JSON. A Worker variable holds at most 5 KB. |
+| `CLOUDFLARE_STS_API_POLICY_KV` | Workers KV namespace | yes | Holds the [policy](#policy), as JSON, under the key `policy`. No size limit to speak of (a Worker variable held 5 KB). Each isolate keeps the policy it read for a minute. |
 | `CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN` | Secrets Store secret | yes | Account-owned token with Account API Tokens Write, plus R2 permissions covering what profiles' buckets delegate. Read on every request, so rotating the secret takes effect without a redeploy. Anything else, such as a plain `wrangler secret`, is refused with `500`. |
 | `CLOUDFLARE_STS_API_SIGNING_KEY` | Secrets Store secret | for profiles with an `audience` | RSA private key (at least 2048 bits), as a PKCS#8 PEM, the broker signs [its own tokens](#tokens-for-other-services) with. Without it the broker issues none, publishes no keys, and those profiles fail closed with `500`. Bound as anything else, it's refused with `500`, as the Cloudflare token is. |
 
 The hourly cron (`17 * * * *` in the examples) deletes expired `cloudflare-sts:*` tokens.
 
 The Terraform module builds the policy from its `oidc_providers`, `profiles`
-and `defaults` variables and binds it, so the policy changes with a deploy and
-rolls back with it. Under `wrangler dev`, it's
-the integration tests' policy in `wrangler.toml`.
+and `defaults` variables and writes it to the KV namespace it binds. Under
+`wrangler dev`, it's the integration tests' `tests/policy.json`, which
+`tests/run.sh` puts in the local namespace.
 
-The bindings are read on every request. An unset account, an invalid policy, or a
+**A policy change takes effect within about two minutes**, not at once: an isolate holds
+the policy it read for 60 seconds, and KV's own edge cache can serve the previous
+value for up to 60 more. That includes switching a profile off with
+`enabled: false`, so for an incident revoke the Cloudflare token instead (see
+[Buckets](#buckets)), which cuts off every credential within seconds. The policy
+is no longer part of a Worker version: rolling the Worker back doesn't roll it
+back.
+
+It fails closed. Once an isolate's policy has expired, a KV read that fails, or a
+policy that's missing or invalid, is a `500` on every request; the broker never
+serves a policy it has held past its minute.
+
+**Moving from a version that took `CLOUDFLARE_STS_API_POLICY`:** upgrade the
+Terraform module, which creates the namespace and writes the policy. A Worker
+that still has the old variable is refused (`500`, with where it went in the log), so
+a stale deployment is never mistaken for a working one.
+
+The bindings are read on every request. An unset account, an unreadable or invalid policy, or a
 Cloudflare token or signing key outside Secrets Store is a `500` on every route, the health
 endpoints' too, with the first problem in a `misconfigured` log line, such as
-`{"level":"ERROR","event":"misconfigured","message":"CLOUDFLARE_STS_API_POLICY: profiles[1].claims must contain at least one claim set"}`.
+`{"level":"ERROR","event":"misconfigured","message":"CLOUDFLARE_STS_API_POLICY_KV: profiles[1].claims must contain at least one claim set"}`.
 
 ## Policy
 

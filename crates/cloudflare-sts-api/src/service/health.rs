@@ -1,7 +1,7 @@
 //! The broker's readiness check, for `/health/ready`.
 //!
-//! [`Config::from_env`] checks what it can without reading anything: the
-//! bindings and the policy, and a Worker that fails it serves nothing.
+//! [`Config::load`] checks the bindings and the policy, read from KV, and a
+//! Worker that fails it serves nothing.
 //! [`ConfigCheck`] checks the rest of the configuration, what only reading it
 //! can: the secrets an exchange reads, the Cloudflare token, and the signing
 //! key if one is bound, imported as the broker would sign with it. A secret
