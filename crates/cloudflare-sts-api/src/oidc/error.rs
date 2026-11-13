@@ -10,14 +10,17 @@ pub enum Error {
     /// `invalid_token`: malformed, not signed by its issuer's keys, for
     /// another audience, expired, or from an issuer no provider is for.
     InvalidToken(String),
-    /// `insufficient_scope`: a valid token none of the
-    /// [`ClaimRules`](crate::oidc::ClaimRules) matches. Which would have isn't
-    /// said: that's the configuration, not the caller's to probe.
+    /// `insufficient_scope`: a valid token the policy doesn't admit. Which
+    /// policy would have isn't said: that's the configuration, not the
+    /// caller's to probe.
     InsufficientScope {
         /// The token's `iss`.
         issuer: String,
         /// The token's `sub`.
         subject: Option<String>,
+        /// The `@id`s of the policies that forbade it, for the log: none if
+        /// nothing permitted it.
+        policies: Vec<String>,
     },
     /// `temporarily_unavailable`: the issuer's metadata or keys couldn't be
     /// had. Not the caller's fault.
@@ -31,7 +34,7 @@ impl fmt::Display for Error {
                 f.write_str(message)
             }
             Self::InsufficientScope { issuer, .. } => {
-                write!(f, "the token matches none of {issuer}'s claim sets")
+                write!(f, "the policy doesn't admit a token from {issuer}")
             }
         }
     }

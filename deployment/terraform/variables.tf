@@ -54,18 +54,12 @@ variable "oidc_providers" {
     jwks_uri  = optional(string)
     typ       = optional(string)
     client_id = optional(string)
-    claims    = list(map(string))
   }))
-  description = "The OIDC issuers whose tokens the broker takes: the policy's providers. Each has a name for profiles to refer to, its issuer, the audience its tokens must have (the broker's URL by default, which is what the action asks for), optionally where its keys are, the typ its tokens must have (such as at+jwt), and, for one people sign in with, the client_id they sign in as, which is then its audience; and the claim sets every token from it must match one of. See the broker's README."
+  description = "The OIDC issuers whose tokens the broker takes: the policy's providers. Each has a name for profiles to refer to, its issuer, the audience its tokens must have (the broker's URL by default, which is what the action asks for), optionally where its keys are, the typ its tokens must have (such as at+jwt), and, for one people sign in with, the client_id they sign in as, which is then its audience. Which of a provider's tokens get in is the `cedar_policy`'s: it must admit every provider. See the broker's README."
 
   validation {
     condition     = length(var.oidc_providers) > 0
     error_message = "Name at least one provider."
-  }
-
-  validation {
-    condition     = alltrue([for provider in var.oidc_providers : length(provider.claims) > 0 && alltrue([for set in provider.claims : length(set) > 0])])
-    error_message = "Every provider needs at least one claim set, pinning it to your organization, and no claim set may be empty."
   }
 
   validation {
@@ -78,11 +72,21 @@ variable "profiles" {
   # Untyped: a token policy's resources are flat or nested maps, as Cloudflare
   # takes them, and no one Terraform type holds both. The broker checks them.
   type        = any
-  description = "What callers may get: the policy's profiles. A list of objects, each with a name, claim sets, and a token, a bucket or a service's audience, as the broker's README describes."
+  description = "What callers may get: the policy's profiles. A list of objects, each with a name, optionally the forward_claims to copy into a token for a service, and a token, a bucket or a service's audience, as the broker's README describes. Who gets each is the `cedar_policy`'s."
 
   validation {
-    condition     = try(length(var.profiles) > 0 && alltrue([for profile in var.profiles : length(profile.name) > 0 && length(profile.claims) > 0]), false)
-    error_message = "profiles must be a list of objects, each with a name and at least one claim set."
+    condition     = try(length(var.profiles) > 0 && alltrue([for profile in var.profiles : length(profile.name) > 0]), false)
+    error_message = "profiles must be a list of objects, each with a name."
+  }
+}
+
+variable "cedar_policy" {
+  type        = string
+  description = "Who gets what, as a Cedar policy: a permit for `Admit::Action::\"<provider>\"` for every provider, pinning your organization, and a permit for `Profile::Action::\"<name>\"` for every profile, each policy with an @id. Usually file(\"$${path.module}/policy.cedar\"). The broker refuses a policy that leaves a provider or a profile without one. See the broker's README."
+
+  validation {
+    condition     = trimspace(var.cedar_policy) != ""
+    error_message = "cedar_policy must not be empty: without a permit, nobody gets anything."
   }
 }
 

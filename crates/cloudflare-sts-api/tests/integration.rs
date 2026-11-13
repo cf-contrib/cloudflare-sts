@@ -1,6 +1,6 @@
 //! End-to-end tests of the Worker under `wrangler dev`, with the OIDC issuers
 //! and Cloudflare replaced by the stand-ins in `helper`, and the policy in
-//! `tests/policy.json`. Run with `tests/run.sh`.
+//! `tests/config.toml` and `tests/policy.cedar`. Run with `tests/run.sh`.
 
 #![cfg(feature = "integration")]
 
@@ -128,7 +128,7 @@ mod token_exchange_for_jobs {
             json!({
                 "profile": "workers-deploy",
                 "sub": "repo:example-org/api:environment:prod",
-                // Only the claims the policy matches on.
+                // Only the claims the profile forwards.
                 "claims": {
                     "repository": "example-org/api",
                     "repository_owner_id": OWNER_ID,
@@ -176,7 +176,7 @@ mod token_exchange_for_jobs {
         assert_refused(
             &t.deny().await,
             "invalid_request",
-            "the token matches none of provider github's claim sets",
+            "the policy doesn't admit the token to provider github",
         );
         assert_eq!(token_count(), 1); // only the Cloudflare token
     }
@@ -855,7 +855,7 @@ mod providers {
     }
 
     #[tokio::test]
-    async fn holds_every_token_to_its_providers_claims() {
+    async fn holds_every_token_to_its_providers_admit_policy() {
         let (t, gitlab) = setup().await;
         let res = job_token(
             &gitlab_token(&gitlab, gitlab_claims(json!({ "namespace_id": "4000002" }))),
@@ -868,7 +868,7 @@ mod providers {
         assert_refused(
             &deny,
             "invalid_request",
-            "the token matches none of provider gitlab's claim sets",
+            "the policy doesn't admit the token to provider gitlab",
         );
     }
 
@@ -982,12 +982,12 @@ mod providers {
                 "sub": "project_path:group/app:ref_type:branch:ref:main",
                 "provider": "gitlab",
                 "profile": "gitlab-cache",
-                // What the policy matched on, so the service can match on it too.
+                // What the profile forwards, so the service can match on it too.
                 "project_path": "group/app",
                 "namespace_id": "4000001",
             }),
         );
-        // Claims nobody matched on stay behind.
+        // Claims the profile doesn't forward stay behind.
         assert!(claims.get("project_id").is_none());
     }
 }
@@ -1041,7 +1041,7 @@ mod tokens_for_other_services {
                 "client_id": "github",
                 "provider": "github",
                 "profile": "nix-push",
-                // What the profile and its provider match on, so the service can too.
+                // What the profile forwards, so the service can match on it too.
                 "repository_owner_id": OWNER_ID,
                 "ref": "refs/heads/main",
             }),

@@ -11,8 +11,9 @@
 //!    keys, found through its metadata (or a configured `jwks_uri`) and never
 //!    through anything in the token. Then its registered [`Claims`] are
 //!    validated: `iss`, `aud`, `exp` and `nbf`.
-//! 2. [`ClaimRules::authorize`] matches its claims against the policy, which
-//!    no RFC says anything about.
+//! 2. What the policy lets in is the broker's to decide, not this module's:
+//!    the Cedar policy admits a provider's tokens, as the service's `authz`
+//!    does, which no RFC says anything about.
 //!
 //! Keys are cached per isolate, and so is each verified token until it
 //! expires: [`verified`] reads it back, so whoever verified a token can hand
@@ -48,5 +49,5 @@ pub use crate::oidc::{
     error::{Error, KeyError},
     jwt::{ALGORITHM, AT_JWT, AccessTokenClaims, Claims, Header, Jwt},
     sign::SigningKey,
-    verify::{ClaimRules, Provider, Providers, check_url, verified},
+    verify::{Provider, Providers, check_url, verified},
 };

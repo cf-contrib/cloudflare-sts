@@ -22,8 +22,12 @@ secret() {
 secret cloudflare-token test-cloudflare-token
 secret signing-key "$(cat "$KEYS/signing.pem")"
 
-# The policy: a KV key, as in a deployment. The Worker holds it for a minute.
-wrangler kv key put policy --path tests/policy.json --binding CLOUDFLARE_STS_API_POLICY_KV --local --persist-to "$PERSIST" >/dev/null
+# The policy: two KV keys, as in a deployment. The Worker holds it for a minute.
+kv() {
+  wrangler kv key put "$1" --path "$2" --binding CLOUDFLARE_STS_API_POLICY_KV --local --persist-to "$PERSIST" >/dev/null
+}
+kv config tests/config.toml
+kv policy tests/policy.cedar
 
 wrangler dev --persist-to "$PERSIST" --test-scheduled >"$LOG" 2>&1 &
 DEV=$!

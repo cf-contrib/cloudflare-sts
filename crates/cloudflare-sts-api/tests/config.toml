@@ -1,0 +1,145 @@
+version = 4
+issuer = "http://127.0.0.1:8790"
+
+[defaults]
+ttl = "15m"
+max_ttl = "1h"
+
+[[providers]]
+name = "github"
+issuer = "http://127.0.0.1:8791/issuers/actions"
+audience = "http://127.0.0.1:8790"
+
+[[providers]]
+name = "gitlab"
+issuer = "http://127.0.0.1:8791/issuers/gitlab"
+audience = "http://127.0.0.1:8790"
+
+[[providers]]
+name = "mismatched"
+issuer = "http://127.0.0.1:8791/issuers/mismatched"
+audience = "http://127.0.0.1:8790"
+
+[[providers]]
+name = "pinned"
+issuer = "http://127.0.0.1:8791/issuers/pinned"
+audience = "http://127.0.0.1:8790"
+jwks_uri = "http://127.0.0.1:8791/issuers/pinned/.well-known/jwks"
+
+[[providers]]
+name = "typed"
+issuer = "http://127.0.0.1:8791/issuers/typed"
+audience = "http://127.0.0.1:8790"
+typ = "at+jwt"
+
+[[providers]]
+name = "access"
+issuer = "http://127.0.0.1:8791/issuers/access"
+client_id = "test-access-client-id"
+
+[[profiles]]
+name = "example-org/infra:ci.apply"
+provider = "github"
+forward_claims = ["repository_owner_id", "repository_id", "ref", "environment"]
+[[profiles.token.policies]]
+permissions = ["Zone Write", "DNS Write"]
+resources = { "com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210" = "*" }
+
+[[profiles]]
+name = "workers-deploy"
+provider = "github"
+forward_claims = ["repository", "repository_owner_id", "ref", "environment"]
+[[profiles.token.policies]]
+permissions = ["Workers Scripts Write"]
+resources = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+
+[[profiles]]
+name = "misspelled"
+provider = "github"
+forward_claims = ["repository_owner_id", "environment"]
+[[profiles.token.policies]]
+permissions = ["Workers Scrpts Write"]
+resources = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+
+[[profiles]]
+name = "lb-account"
+provider = "github"
+forward_claims = ["repository_owner_id", "environment"]
+[[profiles.token.policies]]
+permissions = ["Load Balancers Write"]
+resources = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+
+[[profiles]]
+name = "lb-zone"
+provider = "github"
+forward_claims = ["repository_owner_id", "environment"]
+[[profiles.token.policies]]
+permissions = ["Load Balancers Write"]
+resources = { "com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210" = "*" }
+
+[[profiles]]
+name = "terraform-state"
+provider = "github"
+forward_claims = ["environment", "repository", "repository_owner_id"]
+bucket = { "name" = "org-terraform-state", "permission" = "object-read-write", "prefixes" = ["github.com/{repository}/"] }
+
+[[profiles]]
+name = "whole-bucket"
+provider = "github"
+max_ttl = "30m"
+forward_claims = ["repository_owner_id", "environment"]
+bucket = { "name" = "org-terraform-state", "permission" = "object-read-only" }
+
+[[profiles]]
+name = "state-and-deploy"
+provider = "github"
+ttl = "10m"
+forward_claims = ["repository_owner_id", "environment"]
+bucket = { "name" = "org-terraform-state", "permission" = "object-read-write", "prefixes" = ["{repository_id}/"] }
+[[profiles.token.policies]]
+permissions = ["Workers Scripts Write"]
+resources = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+
+[[profiles]]
+name = "owner-state"
+provider = "github"
+forward_claims = ["repository_owner_id", "environment"]
+bucket = { "name" = "org-terraform-state", "permission" = "object-read-write", "prefixes" = ["{repository_owner}/"] }
+
+[[profiles]]
+name = "nix-push"
+provider = "github"
+audience = "https://cloudflare-nix-api.example.com"
+forward_claims = ["repository_owner_id", "ref"]
+
+[[profiles]]
+name = "gitlab-deploy"
+provider = "gitlab"
+forward_claims = ["namespace_id", "project_path", "ref_protected"]
+[[profiles.token.policies]]
+permissions = ["Workers Scripts Write"]
+resources = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+
+[[profiles]]
+name = "gitlab-cache"
+provider = "gitlab"
+audience = "https://cloudflare-nix-api.example.com"
+forward_claims = ["project_path", "namespace_id"]
+
+[[profiles]]
+name = "gitlab-state"
+provider = "gitlab"
+forward_claims = ["namespace_id", "project_path"]
+bucket = { "name" = "org-terraform-state", "permission" = "object-read-write", "prefixes" = ["gitlab.com/{project_path}/", "{namespace_id}/{project_id}/"] }
+
+[[profiles]]
+name = "pinned-cache"
+provider = "pinned"
+audience = "https://cloudflare-nix-api.example.com"
+forward_claims = ["namespace_id"]
+
+[[profiles]]
+name = "example-org/app:tofu-plan"
+provider = "access"
+forward_claims = ["email"]
+bucket = { "name" = "org-terraform-state", "permission" = "object-read-only", "prefixes" = ["github.com/example-org/app/"] }

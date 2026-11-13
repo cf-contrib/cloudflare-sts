@@ -17,20 +17,21 @@ module "cloudflare_sts_api" {
     {
       name   = "com.github.actions"
       issuer = "https://token.actions.githubusercontent.com"
-      claims = [{ repository_owner_id = "100000001" }] # pin the provider: your numeric org ID
     },
   ]
 
   profiles = [
     {
-      name   = "example-org/app:ci.deploy"
-      claims = [{ repository_id = "200000003", ref = "refs/heads/main", environment = "prod" }] # example-org/app
+      name = "example-org/app:ci.deploy"
       token = { policies = [{
         permissions = ["Workers Scripts Write"]
         resources   = { "com.cloudflare.api.account.${var.account_id}" = "*" }
       }] }
     },
   ]
+
+  # Who gets what: a permit for every provider (pinning your org) and profile.
+  cedar_policy = file("${path.module}/policy.cedar")
 }
 
 output "cloudflare_sts_api_url" {
@@ -115,42 +116,45 @@ Either way the broker is reachable on exactly one URL, the `url` output, which i
 
 ## Policy
 
-The policy is three variables, as cloudflare-nix's module takes its providers,
-in the policy's own format (see the [broker's README](../../crates/cloudflare-sts-api#policy)):
+The policy is three variables and a Cedar file (see the [broker's
+README](../../crates/cloudflare-sts-api#policy)): what the broker trusts and
+hands out, as HCL, and who gets it, as Cedar.
 
 - `oidc_providers`: the OIDC issuers the broker trusts. Typed, and checked at
-  plan time: every provider needs at least one claim set, and none may be empty. `audience` defaults to the
-  broker's URL, which is what the action asks for. For people signing in
-  through Cloudflare Access, see [People](#people).
+  plan time. `audience` defaults to the broker's URL, which is what the action
+  asks for. For people signing in through Cloudflare Access, see
+  [People](#people).
 - `profiles`: what callers may get. Untyped, because a token policy's
   `resources` are flat in one profile and nested in another, as Cloudflare
-  takes them; the plan checks each has a name and a claim set, and the broker
-  checks the rest.
+  takes them; the plan checks each has a name, and the broker checks the rest.
+  `forward_claims` names the caller's claims to copy into a token for another
+  service.
 - `defaults`: the TTLs of profiles that don't set their own.
+- `cedar_policy`: who gets what, as Cedar text. It must permit
+  `Admit::Action::"<provider>"` for every provider, pinning your organization,
+  and `Profile::Action::"<name>"` for every profile, each policy with an `@id`.
+  The broker refuses a policy that leaves one out, so a typo in a name is an
+  error, not a silent deny.
 
-The module fills in the rest: the policy's `version`, and its `issuer`, the
-broker's URL. Since it's plain HCL, IDs can come from data sources, so none are
-hard-coded:
+The module fills in the rest: the configuration's `version`, and its `issuer`,
+the broker's URL.
 
 ```hcl
   oidc_providers = [{
     name   = "com.github.actions"
     issuer = "https://token.actions.githubusercontent.com"
-    claims = [{ repository_owner_id = data.github_organization.org.id }]
   }]
 
   profiles = [
     {
-      name   = "${data.github_repository.app.full_name}:ci.deploy" # from the same repo as its claims
-      claims = [{ repository_id = data.github_repository.app.repo_id }]
+      name = "example-org/app:ci.deploy"
       token = { policies = [{
         permissions = ["Workers Scripts Write"]
         resources   = { "com.cloudflare.api.account.${var.account_id}" = "*" }
       }] }
     },
     {
-      name   = "terraform-state" # every repo gets its own prefix in one shared bucket
-      claims = [{ ref = "refs/heads/main" }]
+      name = "terraform-state" # every repo gets its own prefix in one shared bucket
       bucket = {
         name       = "org-terraform-state"
         permission = "object-read-write"
@@ -158,16 +162,53 @@ hard-coded:
       }
     },
   ]
+
+  cedar_policy = file("${path.module}/policy.cedar")
 ```
+
+with `policy.cedar` next to it, a plain Cedar file your editor and `cedar
+validate` can read, and whose diff is the review:
+
+```cedar
+@id("admit-github")
+permit (principal, action == Admit::Action::"com.github.actions", resource)
+when { context.repository_owner_id == "100000001" };               // your org's numeric ID
+
+@id("app-deploy")
+permit (principal, action == Profile::Action::"example-org/app:ci.deploy", resource)
+when { context.repository_id == "200000003" && context.ref == "refs/heads/main" };   // example-org/app
+
+@id("state-from-main")
+permit (principal, action == Profile::Action::"terraform-state", resource)
+when { context.ref == "refs/heads/main" };
+```
+
+IDs rarely change, so writing them in the file is usually best. To take them
+from data sources instead, use `templatefile` and wrap each value in
+`jsonencode`, so it's a properly escaped Cedar string and can't change what
+the policy means:
+
+```hcl
+  cedar_policy = templatefile("${path.module}/policy.cedar.tftpl", {
+    owner_id = data.github_organization.org.id
+  })
+```
+
+```cedar
+when { context.repository_owner_id == ${jsonencode(tostring(owner_id))} };
+```
+
+A profile's name must match between `profiles` and the Cedar policy. The
+broker checks it when it loads the policy, not Terraform when it plans, so a
+typo fails closed (`500`, `/health/ready` says why) after the apply.
 
 Bucket prefixes use the broker's own `{claim}` placeholders, which HCL leaves
 alone. Don't write `${repository}`: Terraform would try to fill it in and fail
 the plan.
 
-A policy kept in a file still works: `profiles = yamldecode(file("${path.module}/policy.yaml")).profiles`.
-
-The policy is compact JSON under the key `policy` of a Workers KV namespace
-the module creates, bound as `CLOUDFLARE_STS_API_POLICY_KV`. It has no size
+The configuration is compact JSON under the key `config` of a Workers KV
+namespace the module creates, and the Cedar policy is under `policy`, bound as
+`CLOUDFLARE_STS_API_POLICY_KV`. It has no size
 limit to speak of, so 50 repos' profiles fit. A policy change updates the key
 and creates no Worker version, and takes effect within about two minutes: the
 Worker holds it for a minute, and KV's edge cache can add another. It doesn't
@@ -202,7 +243,6 @@ module "cloudflare_sts_api" {
       name      = "com.cloudflare.access"
       issuer    = module.cloudflare_access_saas_oidc.issuer
       client_id = module.cloudflare_access_saas_oidc.client_id # people's ID tokens' audience
-      claims    = [{ iss = module.cloudflare_access_saas_oidc.issuer }]
     },
   ]
 
@@ -210,7 +250,6 @@ module "cloudflare_sts_api" {
     {
       name     = "infra-admins:tofu-plan"
       provider = "com.cloudflare.access"
-      claims   = [{ email = "alice@example.com" }, { email = "bob@example.com" }]
       max_ttl  = "1h"
       bucket   = { name = "org-terraform-state", permission = "object-read-only" }
     },
@@ -218,8 +257,10 @@ module "cloudflare_sts_api" {
 }
 ```
 
-The provider's one claim set pins the application's own issuer; the profiles
-name the people, by `email`. Then, on each person's machine:
+In the Cedar policy, the provider's `Admit` permit pins the application's own
+issuer (`context.iss`), and the profile's permit names the people, by `email`
+(`["alice@example.com", "bob@example.com"].contains(context.email)`). Then, on
+each person's machine:
 
 ```toml
 # ~/.config/cf-vault/config.toml
@@ -302,8 +343,9 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
 | `zone_id` | for a custom domain | `null` | Zone ID of the zone holding a custom-domain `hostname`. |
 | `cloudflare_token_secret` | yes | | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the Cloudflare token. With a profile's `bucket`, the token also needs R2 permissions covering what it delegates. |
 | `signing_key_secret` | for profiles with an `audience` | `null` | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the RSA key the broker signs its own tokens with. See [Tokens for other services](../../crates/cloudflare-sts-api#tokens-for-other-services). |
-| `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ?, client_id?, claims }` each. `audience` defaults to the `client_id` [people](../../crates/cloudflare-sts-api#people) sign in as, if there is one, and otherwise to the broker's URL. See [Policy](#policy). |
-| `profiles` | yes | | What callers may get, in the policy's format. See [Policy](#policy). |
+| `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ?, client_id? }` each. `audience` defaults to the `client_id` [people](../../crates/cloudflare-sts-api#people) sign in as, if there is one, and otherwise to the broker's URL. See [Policy](#policy). |
+| `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `audience`. See [Policy](#policy). |
+| `cedar_policy` | yes | | Who gets what: Cedar text with a permit for `Admit::Action::"<provider>"` for every provider, pinning your org, and `Profile::Action::"<name>"` for every profile, each with an `@id`. See [Policy](#policy). |
 | `defaults` | no | `{}` | `{ ttl?, max_ttl? }`: the TTLs of profiles that don't set their own. |
 | `worker_dir` | no | `null` | A local build (`index.js`, `index_bg.wasm`) to deploy instead of a release. |
 | `release_tag` | no | the module's release | Release to deploy, or `latest`. |

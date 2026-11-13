@@ -2,17 +2,17 @@
 
 > The broker, the Worker half of [cloudflare-sts](../..), in Rust: verifies an
 > OIDC token from an issuer you trust (GitHub Actions, GitLab CI, Cloudflare
-> Access, …), matches its claims against your policy, and mints a short-lived
+> Access, …), checks it against your Cedar policy, and mints a short-lived
 > Cloudflare API token with exactly that profile's permissions, R2 credentials
 > limited to the caller's key prefix, or both. It knows no issuer by name: who
-> may do what is in the policy's claim sets, as in cloudflare-nix.
+> may do what is in the Cedar policy.
 
 [![CI](https://github.com/cf-contrib/cloudflare-sts/actions/workflows/ci.yml/badge.svg)](https://github.com/cf-contrib/cloudflare-sts/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../../LICENSE)
 
 > [!NOTE]
 > **Pre-1.0.** The policy format and the API may still change between minor
-> versions. Version 1 and 2 policies need [migrating](#migration-from-version-2).
+> versions. Version 1 to 3 policies need [migrating](#migration-from-version-3).
 
 ```yaml
 version: 3
@@ -63,30 +63,36 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
 | Binding | Type | Required | Description |
 |---|---|---|---|
 | `CLOUDFLARE_STS_API_ACCOUNT_ID` | plain text | yes | Account the Cloudflare token belongs to and tokens are minted in. |
-| `CLOUDFLARE_STS_API_POLICY_KV` | Workers KV namespace | yes | Holds the [policy](#policy), as JSON, under the key `policy`. No size limit to speak of (a Worker variable held 5 KB). Each isolate keeps the policy it read for a minute. |
+| `CLOUDFLARE_STS_API_POLICY_KV` | Workers KV namespace | yes | Holds the [policy](#policy) under two keys: `config`, the TOML (or JSON), and `policy`, the Cedar. No size limit to speak of (a Worker variable held 5 KB). Each isolate keeps the policy it read for a minute. |
 | `CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN` | Secrets Store secret | yes | Account-owned token with Account API Tokens Write, plus R2 permissions covering what profiles' buckets delegate. Read on every request, so rotating the secret takes effect without a redeploy. Anything else, such as a plain `wrangler secret`, is refused with `500`. |
 | `CLOUDFLARE_STS_API_SIGNING_KEY` | Secrets Store secret | for profiles with an `audience` | RSA private key (at least 2048 bits), as a PKCS#8 PEM, the broker signs [its own tokens](#tokens-for-other-services) with. Without it the broker issues none, publishes no keys, and those profiles fail closed with `500`. Bound as anything else, it's refused with `500`, as the Cloudflare token is. |
 
 The hourly cron (`17 * * * *` in the examples) deletes expired `cloudflare-sts:*` tokens.
 
-The Terraform module builds the policy from its `oidc_providers`, `profiles`
-and `defaults` variables and writes it to the KV namespace it binds. Under
-`wrangler dev`, it's the integration tests' `tests/policy.json`, which
-`tests/run.sh` puts in the local namespace.
+The Terraform module builds `config` from its `oidc_providers`, `profiles`
+and `defaults` variables, takes `policy` from its `cedar_policy`, and writes
+both to the KV namespace it binds. Under `wrangler dev`, they're the
+integration tests' `tests/config.toml` and `tests/policy.cedar`, which
+`tests/run.sh` puts in the local namespace. By hand:
+`wrangler kv key put config --path config.toml --namespace-id <id>`, then
+`policy` the same way.
 
 **A policy change takes effect within about two minutes**, not at once: an isolate holds
 the policy it read for 60 seconds, and KV's own edge cache can serve the previous
 value for up to 60 more. That includes switching a profile off with
-`enabled: false`, so for an incident revoke the Cloudflare token instead (see
+`enabled = false`, so for an incident revoke the Cloudflare token instead (see
 [Buckets](#buckets)), which cuts off every credential within seconds. The policy
 is no longer part of a Worker version: rolling the Worker back doesn't roll it
 back.
 
 It fails closed. Once an isolate's policy has expired, a KV read that fails, or a
 policy that's missing or invalid, is a `500` on every request; the broker never
-serves a policy it has held past its minute.
+serves a policy it has held past its minute. The two keys are read one after the
+other, so a change to both can briefly be seen half done. That fails closed too:
+a profile with no permit, or a permit for one that's gone, is refused when the
+policy loads, and the next read, a minute on, picks up both.
 
-**Moving from a version that took `CLOUDFLARE_STS_API_POLICY`:** upgrade the
+**Moving from a version that took `CLOUDFLARE_STS_API_POLICY`** (a version 3 policy; see [Migration](#migration-from-version-3)): upgrade the
 Terraform module, which creates the namespace and writes the policy. A Worker
 that still has the old variable is refused (`500`, with where it went in the log), so
 a stale deployment is never mistaken for a working one.
@@ -94,103 +100,132 @@ a stale deployment is never mistaken for a working one.
 The bindings are read on every request. An unset account, an unreadable or invalid policy, or a
 Cloudflare token or signing key outside Secrets Store is a `500` on every route, the health
 endpoints' too, with the first problem in a `misconfigured` log line, such as
-`{"level":"ERROR","event":"misconfigured","message":"CLOUDFLARE_STS_API_POLICY_KV: profiles[1].claims must contain at least one claim set"}`.
+`{"level":"ERROR","event":"misconfigured","message":"CLOUDFLARE_STS_API_POLICY_KV: provider com.github.actions has no policy admitting it: add a permit for Admit::Action::\\"com.github.actions\\" that pins your tenant"}`.
 
 ## Policy
 
-```yaml
-version: 3
-issuer: https://cloudflare-sts-api.example.com   # REQUIRED: the broker's URL, as its own tokens name it: an origin, no trailing /
+The policy is two files, kept in the `config` and `policy` keys of the [KV namespace](#bindings): what the broker trusts and hands out, in TOML, and who gets it, in [Cedar](https://www.cedarpolicy.com).
 
-providers:
-  - name: com.github.actions                 # GitHub Actions
-    issuer: https://token.actions.githubusercontent.com   # GitHub Enterprise Cloud: .../<enterprise>
-    audience: https://cloudflare-sts-api.example.com        # what the action asks GitHub for: the broker's URL
-    claims:
-      - repository_owner_id: "100000001"     # REQUIRED: pin your org's numeric ID
+`config.toml` (JSON works too, which is what the Terraform module writes):
 
-  - name: com.gitlab                         # GitLab CI, with id_tokens: { aud: <the broker's URL> }
-    issuer: https://gitlab.com
-    audience: https://cloudflare-sts-api.example.com
-    claims:
-      - namespace_id: "4000001"              # REQUIRED: pin your group's ID
+```toml
+version = 4
+issuer  = "https://cloudflare-sts-api.example.com"   # REQUIRED: the broker's URL, as its own tokens name it: an origin, no trailing /
 
-  - name: com.cloudflare.access              # people, through an Access for SaaS OIDC application
-    issuer: https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client-id>
-    client_id: <client-id>                   # people sign in as this client: see People
-    claims:
-      - iss: https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client-id>   # the app is the pin
+[defaults]
+ttl     = "15m"   # default 15m
+max_ttl = "1h"    # default 1h, at most 24h
 
-defaults:
-  ttl: 15m     # default 15m
-  max_ttl: 1h  # default 1h, at most 24h
+[[providers]]
+name     = "com.github.actions"                                # GitHub Actions
+issuer   = "https://token.actions.githubusercontent.com"       # GitHub Enterprise Cloud: .../<enterprise>
+audience = "https://cloudflare-sts-api.example.com"            # what the action asks GitHub for: the broker's URL
 
-profiles:
-  - name: example-org/infra:ci.apply    # the apply job in example-org/infra's ci.yml
-    provider: com.github.actions
-    claims:
-      - repository_id: "200000002"      # example-org/infra
-        ref: refs/heads/main
-        environment: prod               # pair with required reviewers on the environment
-    token:
-      policies:
-        - permissions: ["Zone Write", "Zone WAF Write", "DNS Write"]
-          resources:
-            com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210: "*" # example.com
+[[providers]]
+name     = "com.gitlab"                                        # GitLab CI, with id_tokens: { aud: <the broker's URL> }
+issuer   = "https://gitlab.com"
+audience = "https://cloudflare-sts-api.example.com"
 
-  - name: example-org:workers-deploy    # any repo in the org: named for its purpose
-    provider: com.github.actions
-    claims:                             # any one of these sets
-      - repository: "example-org/*"     # a trailing * is allowed on non-ID claims
-        ref: refs/heads/main
-        environment: prod
-      - repository: "example-org/*"
-        ref: refs/heads/release/*
-        environment: prod
-    token:
-      policies:
-        - permissions: ["Workers Scripts Write"]
-          resources:
-            com.cloudflare.api.account.0123456789abcdef0123456789abcdef: "*"
+[[providers]]
+name      = "com.cloudflare.access"                            # people, through an Access for SaaS OIDC application
+issuer    = "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client-id>"
+client_id = "<client-id>"                                      # people sign in as this client: see People
 
-  - name: group/app:deploy              # the deploy job in group/app's .gitlab-ci.yml
-    provider: com.gitlab
-    claims:
-      - project_path: group/app
-        ref_protected: "true"
-    ttl: 5m                             # for everything the profile hands out
-    token:
-      policies:
-        - effect: allow                 # the default; "deny" carves out exceptions
-          permissions: ["Workers Scripts Write"]
-          resources:
-            com.cloudflare.api.account.0123456789abcdef0123456789abcdef: "*"
+# What each profile hands out. Who gets it is in policy.cedar.
+[[profiles]]
+name     = "example-org/infra:ci.apply"        # the apply job in example-org/infra's ci.yml
+provider = "com.github.actions"
 
-  - name: example-org:terraform-state   # no token: only R2 credentials
-    provider: com.github.actions
-    claims:
-      - ref: refs/heads/main
-    bucket:
-      name: org-terraform-state
-      permission: object-read-write
-      prefixes: ["{repository_owner_id}/{repository_id}/"]
+[[profiles.token.policies]]
+permissions = ["Zone Write", "Zone WAF Write", "DNS Write"]
+resources   = { "com.cloudflare.api.account.zone.fedcba9876543210fedcba9876543210" = "*" }   # example.com
 
-  - name: infra-admins:tofu-plan        # for people, through Access
-    provider: com.cloudflare.access
-    claims:                             # any one of these people
-      - email: alice@example.com
-      - email: bob@example.com
-    max_ttl: 1h
-    bucket:
-      name: org-terraform-state
-      permission: object-read-only
+[[profiles]]
+name     = "example-org:workers-deploy"        # any repo in the org: named for its purpose
+provider = "com.github.actions"
+
+[[profiles.token.policies]]
+permissions = ["Workers Scripts Write"]
+resources   = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+
+[[profiles]]
+name     = "group/app:deploy"                  # the deploy job in group/app's .gitlab-ci.yml
+provider = "com.gitlab"
+ttl      = "5m"                                # for everything the profile hands out
+
+[[profiles.token.policies]]
+effect      = "allow"                          # the default; "deny" carves out exceptions
+permissions = ["Workers Scripts Write"]
+resources   = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+
+[[profiles]]
+name     = "example-org:terraform-state"       # no token: only R2 credentials
+provider = "com.github.actions"
+bucket   = { name = "org-terraform-state", permission = "object-read-write", prefixes = ["{repository_owner_id}/{repository_id}/"] }
+
+[[profiles]]
+name     = "infra-admins:tofu-plan"            # for people, through Access
+provider = "com.cloudflare.access"
+max_ttl  = "1h"
+bucket   = { name = "org-terraform-state", permission = "object-read-only" }
+```
+
+`policy.cedar`:
+
+```cedar
+// Every provider is admitted by a permit that pins your tenant, by ID. Without
+// one the broker refuses to start: GitHub gives anyone's repos a token.
+@id("admit-github")
+permit (principal, action == Admit::Action::"com.github.actions", resource)
+when { context.repository_owner_id == "100000001" };               // your org's numeric ID
+
+@id("admit-gitlab")
+permit (principal, action == Admit::Action::"com.gitlab", resource)
+when { context.namespace_id == "4000001" };                        // your group's ID
+
+@id("admit-access")
+permit (principal, action == Admit::Action::"com.cloudflare.access", resource)
+when { context.iss == "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client-id>" };   // the app is the pin
+
+// A forbid beats every permit: written once, it holds for every profile.
+@id("no-pull-request-target")
+forbid (principal, action, resource)
+when { context has event_name && context.event_name == "pull_request_target" };
+
+@id("apply-from-main")
+permit (principal, action == Profile::Action::"example-org/infra:ci.apply", resource)
+when {
+  context.repository_id == "200000002" &&                         // example-org/infra
+  context.ref == "refs/heads/main" &&
+  context.environment == "prod"                                   // pair with required reviewers on the environment
+};
+
+@id("workers-deploy")
+permit (principal, action == Profile::Action::"example-org:workers-deploy", resource)
+when {
+  context.repository like "example-org/*" &&                      // a * may go anywhere in a like pattern
+  context has environment && context.environment == "prod" &&
+  (context.ref == "refs/heads/main" || context.ref like "refs/heads/release/*")
+};
+
+@id("gitlab-deploy")
+permit (principal, action == Profile::Action::"group/app:deploy", resource)
+when { context.project_path == "group/app" && context.ref_protected == "true" };
+
+@id("state-from-main")
+permit (principal, action == Profile::Action::"example-org:terraform-state", resource)
+when { context.ref == "refs/heads/main" };
+
+@id("infra-admins")
+permit (principal, action == Profile::Action::"infra-admins:tofu-plan", resource)
+when { ["alice@example.com", "bob@example.com"].contains(context.email) };
 ```
 
 A profile has a `token`, a `bucket`, or both, for callers with a token from its `provider`. A profile with an `audience` instead issues the broker's own token for that service: see [Tokens for other services](#tokens-for-other-services).
 
-To switch a profile off, for example during an incident, set `enabled: false`. It stays in the policy but never matches, and a request naming it is refused (`invalid_request`).
+To switch a profile off, for example during an incident, set `enabled = false`. It stays in the policy but never matches, and a request naming it is refused (`invalid_request`). Remember [how long a change takes](#bindings).
 
-The broker checks the policy on every request. If it's invalid, the broker fails closed and every request gets `500`. Unknown fields are refused too, so a misspelt one is never silently ignored.
+The broker checks the policy on every load. If it's invalid, the broker fails closed and every request gets `500`. Unknown fields are refused too, so a misspelt one is never silently ignored.
 
 ### Providers
 
@@ -198,31 +233,41 @@ A provider is an OIDC issuer you trust to vouch for a caller. `providers` is a l
 
 | Field | |
 |---|---|
-| `name` | Required, unique. Profiles name it in `provider`. |
+| `name` | Required, unique. Profiles name it in `provider`, and the Cedar policy in `Admit::Action::"<name>"`. |
 | `issuer` | Required. The tokens' `iss`, exactly. `https://`, or plain `http://` on `127.0.0.1`, `localhost` or `[::1]` for local development. One provider per issuer. |
 | `audience` | Required, unless there's a `client_id`. The tokens' `aud` must contain it. Use one only the broker accepts, such as its URL: for GitHub Actions, not GitHub's default `https://github.com/<owner>`, so a token requested for AWS or GCP can't be replayed here. |
 | `jwks_uri` | Optional. Otherwise the keys come from the issuer's metadata: its `/.well-known/openid-configuration`, or, if it has none, its RFC 8414 `/.well-known/oauth-authorization-server`, which must name the same issuer. They never come from a URL in the token. |
 | `typ` | Optional. The `typ` its tokens must have ([RFC 8725 §3.11](https://www.rfc-editor.org/rfc/rfc8725#section-3.11)), such as `at+jwt` to take only another broker's access tokens, so another kind of token its issuer signs can't pass for one. Unset takes any. |
 | `client_id` | Optional. The OAuth client [people](#people) sign in to it as, for an ID token the broker takes: a provider with one is listed in the metadata. It's also the `audience`, which can then be left out. |
-| `claims` | Required: at least one [claim set](#claim-sets). Every token from this provider must match one, whichever profile it gets. |
 
-`audience` is a field, not one of the `claims`, because it says whether the token is meant for the broker at all: it's checked with the signature, `iss` and expiry, before `claims` pick a profile. Either failing is `400` (`invalid_request`), as RFC 8693 has it for a subject token that's invalid or that the policy doesn't take.
+`audience` is a field, not a claim, because it says whether the token is meant for the broker at all: it's checked with the signature, `iss` and expiry, before the Cedar policy sees the token. Either failing is `400` (`invalid_request`), as RFC 8693 has it for a subject token that's invalid or that the policy doesn't take.
 
-**Pin the tenant.** GitHub Actions, gitlab.com and HCP Terraform issue tokens to anyone's projects, and the broker URL is public. A provider's claim sets must pin yours, by ID: `repository_owner_id` for GitHub Actions, `namespace_id` or `project_id` for gitlab.com, `terraform_organization_id` for HCP Terraform. The broker requires a claim set on every provider, but it can't tell which claims pin a tenant: that's yours to get right.
+**Pin the tenant.** GitHub Actions, gitlab.com and HCP Terraform issue tokens to anyone's projects, and the broker URL is public. Every provider needs a `permit` for its `Admit` action that pins yours, by ID: `repository_owner_id` for GitHub Actions, `namespace_id` or `project_id` for gitlab.com, `terraform_organization_id` for HCP Terraform. The broker refuses a provider with none, but it can't tell which claims pin a tenant: that's yours to get right.
 
 A profile's `provider` can be left out when the policy has exactly one provider. Tokens are RS256.
 
-### Claim sets
+### The Cedar policy
 
-`claims`, on a provider or a profile, is a list of claim sets, as in cloudflare-nix. A token matches the list when it matches **any** set, and a set when it matches **all** its claims:
+A caller's token is checked in two steps, each a request to Cedar, which denies unless a `permit` matches and no `forbid` does:
 
-- A token gets a profile when it matches one of its provider's sets **and** one of the profile's.
-- A claim's value is one pattern: a string, a number or a boolean. Numbers and booleans compare as written in JSON, so unquoted YAML IDs work.
-- A pattern can end in one `*` after a prefix, such as `example-org/*` or `refs/heads/release/*`, and then matches any value starting with that prefix, including across `/`. A `*` anywhere else, or on its own, is refused when the policy loads. ID claims (`*_id`) must be exact.
-- A claim that's a list in the token (`groups`, `amr`) matches if any of its entries does. A claim missing from the token never matches.
-- Any claim the issuer puts in its tokens can be matched. GitHub Actions: `repository`, `repository_id`, `ref`, `environment`, `job_workflow_ref`, `runner_environment`, and so on. GitLab CI: `project_path`, `namespace_id`, `ref_protected`, and so on.
-- If the request names a `profile`, that profile must match. Otherwise exactly one profile must match. Both failures are `invalid_request`, and the description says which.
-- A token only matches profiles for the provider whose issuer it names. Naming another provider's profile is refused (`invalid_request`).
+1. **Admit**, once the token is verified: action `Admit::Action::"<provider>"`. This is where the tenant is pinned. A token that fails is `invalid_request`, "the policy doesn't admit the token".
+2. **Profile**, for the profile it gets: action `Profile::Action::"<name>"`. If the request names a `profile`, that one must be allowed. Otherwise exactly one profile of the provider and audience must be. Both failures are `invalid_request`, and the description says which.
+
+Cedar wants an action's type to end in `Action`, hence the namespaces. The request is:
+
+| | |
+|---|---|
+| `principal` | `Caller::"<sub>"`, the token's subject. |
+| `action` | `Admit::Action::"<provider>"` or `Profile::Action::"<profile>"`. |
+| `resource` | `Audience::"<audience>"`, what the profile issues for: `https://api.cloudflare.com` for Cloudflare credentials. |
+| `context` | The token's claims, each a string, or a set of strings if it's a list in the token (`groups`, `amr`). Numbers and booleans are strings as JSON writes them, so an ID is `"100000001"` whether the issuer quoted it or not: always compare with strings. Claims that are objects aren't in it. Reach a claim with a name Cedar can't write, such as a URL, with `context["https://example.com/claim"]`. |
+
+- **A claim the token doesn't have** errors where it's read, and an error makes that policy not match: a `permit` never allows because of it, but a `forbid` doesn't deny either. Guard with `context has claim && ...` where a claim is optional, and in any `forbid`.
+- **Patterns:** `==` is exact. `like` takes a `*` anywhere in a string, matching anything, including across `/`. Keep ID claims (`*_id`) to `==`.
+- **Every policy has an `@id`**, unique, and the audit log names the policies that decided a request (`policy`) instead of a position that changes when someone adds one above.
+- **A `permit` names its actions**, as `Admit::Action::"<provider>"` or `Profile::Action::"<name>"`, so none lets everything in. A `forbid` may leave them open, to hold for all.
+- **Names are checked against the configuration.** A policy naming a provider or profile that doesn't exist is an error, not a silent deny, and so is a provider or an enabled profile that nothing permits.
+- **Nothing here changes what a profile hands out.** Cedar decides who; the TOML decides what. A profile's `forward_claims` says which of the caller's claims a token for [another service](#tokens-for-other-services) carries, and which the audit log shows.
 
 ### People
 
@@ -234,17 +279,19 @@ Access's ID tokens carry `email`, `sub` and the application's `iss`, and last 5 
 
 Keep people's profiles to what they need locally, such as read-only state, and keep `apply` in CI behind `environment: prod` with required reviewers.
 
-### Migration from version 2
+### Migration from version 3
 
-Version 1 and 2 policies are refused (`500`, with `version must be 3` in the log). Move them over:
+Version 3 policies, one JSON or YAML document with `claims` on providers and profiles, are refused (`500`, with `version must be 4` in the log). Split them in two:
 
-| Version 2 | Version 3 |
+| Version 3 | Version 4 |
 |---|---|
-| `version: 2` | `version: 3` |
-| `claims: { a: x, b: y }` on a provider or profile | `claims: [{ a: x, b: y }]`, a list of claim sets |
-| a claim's list of values, `ref: [main, release/*]` | one claim set per value: `claims: [{ ref: main }, { ref: release/* }]` |
-| the provider for `https://github.com` (people's GitHub tokens), `repository_permission`, `team_id` | gone: use an OIDC identity provider for people, such as [Cloudflare Access](#people) |
-| a provider without `claims` for an issuer the broker didn't know | at least one claim set, on every provider |
+| `version: 3`, one document | `version = 4` in `config` (TOML, or JSON), and a Cedar policy in `policy` |
+| `claims: [...]` on a provider | a `permit` for `Admit::Action::"<provider>"` in the Cedar policy |
+| `claims: [...]` on a profile | a `permit` for `Profile::Action::"<name>"`: `{ a: x, b: y }` is `context.a == "x" && context.b == "y"`, several sets are `\|\|`, a trailing `*` is `like "prefix*"` |
+| a token's matched claims, copied and logged | `forward_claims = ["repository", "ref"]` on the profile: Cedar can't say which claims a policy looked at |
+| the policy in a Worker variable | the KV namespace, keys `config` and `policy` (see [Bindings](#bindings)) |
+
+Terraform's `oidc_providers` and `profiles` lose their `claims`, and the module takes a `cedar_policy` instead.
 
 ### Permissions
 
@@ -297,23 +344,28 @@ A profile's `bucket` gets the job [temporary R2 credentials](https://developers.
 
 ### Tokens for other services
 
-A profile with `audience: <service URL>` gives the caller a token the broker signs itself, for another service that trusts the broker, such as [cloudflare-nix](https://github.com/cf-contrib/cloudflare-nix). It has no `token` or `bucket`: who may use the service is decided by the profile's `claims`, like any other.
+A profile with `audience: <service URL>` gives the caller a token the broker signs itself, for another service that trusts the broker, such as [cloudflare-nix](https://github.com/cf-contrib/cloudflare-nix). It has no `token` or `bucket`: who may use the service is decided by the Cedar policy, like any other.
 
-```yaml
-  - name: example-org/app:ci.build
-    provider: com.github.actions
-    audience: https://cloudflare-nix-api.example.com
-    claims:
-      - repository_id: "200000003"      # example-org/app
-        ref: refs/heads/main
-    ttl: 15m
+```toml
+[[profiles]]
+name           = "example-org/app:ci.build"
+provider       = "com.github.actions"
+audience       = "https://cloudflare-nix-api.example.com"
+forward_claims = ["repository_id", "ref"]   # what the service may match on
+ttl            = "15m"
+```
+
+```cedar
+@id("ci-build")
+permit (principal, action == Profile::Action::"example-org/app:ci.build", resource)
+when { context.repository_id == "200000003" && context.ref == "refs/heads/main" };   // example-org/app
 ```
 
 The caller asks for it with [`audience`](#token-exchange) set to the service's URL, and gets a JWT access token the broker signed, as RFC 9068 has it: `typ: at+jwt`, so a service can tell it from any other JWT, and `alg: RS256`, which verifiers support by default.
 
 - `iss` is the broker's URL (the policy's `issuer`), `aud` the service, `sub` the caller's `sub` from its issuer (`<provider>:unknown` if its token has none), and `client_id` the provider's name: the caller doesn't authenticate as a client, so the provider that vouched for it stands in.
 - `provider` and `profile` name where the caller came from and what allowed it, `jti` is unique, and `iat`, `nbf` and `exp` are when it was issued, valid from and until.
-- Verified claims are copied under their issuer's names, so a service can match on them: every claim the profile's or its provider's claim sets name. Nothing else, so an issuer's other claims (such as GitLab's `user_email`) stay behind.
+- Verified claims are copied under their issuer's names, so a service can match on them: every claim the profile's `forward_claims` name. Nothing else, so an issuer's other claims (such as GitLab's `user_email`) stay behind.
 - It lasts the profile's `ttl`, but never past the caller's OIDC token, which lasts minutes. Exchange again for a fresh one: there are no refresh tokens. A subject token already past its `exp`, though accepted within the clock tolerance, gets nothing (`invalid_request`, `the subject token has expired`).
 
 Services find the public key at [`/.well-known/jwks`](#http-api), or through the broker's metadata: RFC 8414's at [`/.well-known/oauth-authorization-server`](#http-api), or OpenID Connect Discovery's at [`/.well-known/openid-configuration`](#http-api) for services that only read that, such as AWS IAM, Google Cloud Workload Identity Federation and Vault. They should check `typ` (`at+jwt`), `iss`, `aud`, `exp` and the `RS256` algorithm, as RFC 9068 §4 says. The broker isn't a full OpenID Provider: tokens come from exchange only, so, as for GitHub's and Kubernetes' issuers, its discovery document has no authorization endpoint. A service that verifies these tokens names the broker as a provider with `typ` `at+jwt`.
@@ -371,8 +423,8 @@ These are recommendations: the broker enforces only the characters and the lengt
 
 These are enforced when the policy loads, so an unsafe policy never serves a request:
 
-1. **Every provider is pinned.** A provider must list at least one claim set, and a token must match one of them whatever profile it asks for. Pin the tenant there for issuers that give tokens to anyone's projects (see [Providers](#providers)).
-2. **Patterns stay narrow.** ID claims can't use `*`, and other claims only as a single trailing `*` after a prefix, so a pattern can't match everything (`*`) or anything ending in a value (`*main`).
+1. **Every provider is pinned.** The Cedar policy must `permit` every provider's `Admit` action, and a token must pass it whatever profile it asks for. Pin the tenant there for issuers that give tokens to anyone's projects (see [Providers](#providers)).
+2. **Every policy is named and scoped.** Each has a unique `@id`, and a `permit` names its provider or profile, so none lets everything in. A policy naming a provider or profile that doesn't exist is refused, and so is an enabled profile that nothing permits.
 3. **No token-management permissions.** Granting (`effect: allow`) any permission group whose name contains `API Tokens`, in any case, is rejected, so a job can't turn its short-lived token into a long-lived one. A `deny` may name one.
 4. **TTLs are capped.** `max_ttl` is at most 24h, and `ttl` can't exceed it.
 5. **Audiences are kept apart.** A request only matches profiles for its `audience`. A profile for another service can't hand out Cloudflare credentials, and its audience must be a bare origin other than the broker's own.
@@ -462,10 +514,10 @@ For the caller's own mistakes (400) the description says what was wrong, for exa
 | Threat | Mitigation |
 |---|---|
 | Forged or tampered JWT | Signature checked against the issuer's JWKS (RS256 only), plus `iss`, `aud`, `exp` and `nbf` with 60s tolerance |
-| A repo outside your org asks for a token | Every provider must list claim sets; pin your tenant's ID there |
+| A repo outside your org asks for a token | Every provider needs an `Admit` permit; pin your tenant's ID there |
 | A token from an issuer you don't trust | Only issuers listed as providers are accepted, by exact `iss`, with keys from that issuer's own metadata or `jwks_uri` |
 | Deleted repo or org re-registered by an attacker | Pin numeric IDs, not names |
-| Malicious PR code gets a prod token | Match `ref: refs/heads/main` and `environment: prod`, with required reviewers on the environment. Fork PRs don't get `id-token: write` on `pull_request`. Don't write profiles that match `event_name: pull_request_target`. |
+| Malicious PR code gets a prod token | Require `ref == "refs/heads/main"` and `environment == "prod"`, with required reviewers on the environment. Fork PRs don't get `id-token: write` on `pull_request`. Add a `forbid` for `event_name == "pull_request_target"`, once, for every profile. |
 | Stolen minted token | 15m default TTL, revoked at job end, expired tokens deleted hourly |
 | Stolen R2 credentials | Limited to one bucket and the repo's prefixes, and short-lived. They can't be revoked one by one; rolling the Cloudflare token revokes all of them |
 | One repo reaches another's R2 keys | Prefixes must end in `/`, placeholders fill whole segments from verified claims with a fixed character set, and both the template and the result are checked. Prefer ID-based prefixes |
@@ -478,7 +530,7 @@ For the caller's own mistakes (400) the description says what was wrong, for exa
 
 ### Audit log
 
-The broker logs with [`tracing`](https://docs.rs/tracing), as JSON lines that Workers Logs indexes by field. Every mint, issue and denial is one line, with its `event` and, once the token is verified, the caller's `provider`, their token's `sub`, and in `claims` the claims the policy's claim sets for them name. Token values, R2 secrets and JWTs are never logged:
+The broker logs with [`tracing`](https://docs.rs/tracing), as JSON lines that Workers Logs indexes by field. Every mint, issue and denial is one line, with its `event` and, once the token is verified, the caller's `provider`, their token's `sub`, and in `claims` the claims their profile's `forward_claims` name. The policies that allowed or forbade a request are named by their `@id` in `policy.allow` and `policy.forbid` lines. Token values, R2 secrets and JWTs are never logged:
 
 ```json
 {"level":"INFO","event":"token.mint","provider":"com.github.actions","profile":"example-org:workers-deploy","sub":"repo:example-org/app:environment:prod","claims":"{\"environment\":\"prod\",\"ref\":\"refs/heads/main\",\"repository\":\"example-org/app\",\"repository_owner_id\":\"100000001\"}","token_id":"<token-id>","expires_at":1790961140}
@@ -505,7 +557,7 @@ Denials are `token.deny`, a warning, with the response's `error`, and its `error
 ```
 
 - **Request problems** (`invalid_request`, `invalid_target`, `unsupported_grant_type`): what the contract refuses, such as another `grant_type`, `actor_token`, a missing field or a JSON body; an invalid subject token, or one from an issuer no provider is for; a `ttl` or `audience` that doesn't fit.
-- **The policy didn't allow it** (`invalid_request` too): the token matches none of its provider's claim sets, no profile matches, several do, the named one doesn't, a claim can't fill a bucket prefix.
+- **The policy didn't allow it** (`invalid_request` too): the policy doesn't admit the token to its provider, no profile matches, several do, the named one doesn't, a claim can't fill a bucket prefix.
 - **Configuration or upstream faults** (`server_error`, `temporarily_unavailable`): a secret that can't be read, an unknown permission name, an issuer's keys, Cloudflare failing.
 
 The other events:
@@ -522,9 +574,9 @@ The other events:
 ## Limitations
 
 - **One account per broker.** Tokens are minted in `CLOUDFLARE_STS_API_ACCOUNT_ID` only. Deploy one broker per account.
-- **RS256 only, one provider per issuer.** Issuers that sign with another algorithm (such as ES256) aren't supported yet. To serve several GitHub orgs, give the provider a claim set per org: `claims: [{ repository_owner_id: "100000001" }, { repository_owner_id: "100000002" }]`.
+- **RS256 only, one provider per issuer.** Issuers that sign with another algorithm (such as ES256) aren't supported yet. To serve several GitHub orgs, admit them all in the provider's `permit`: `["100000001", "100000002"].contains(context.repository_owner_id)`.
 - **OIDC tokens only.** People need an identity provider that issues them one, such as [Cloudflare Access](#people). Rules on a person's role in a GitHub repo can't be expressed: their tokens don't carry it.
-- **The tenant pin is yours to get right.** The broker requires every provider to have claim sets, but knows no issuer's tenant claim by name.
+- **The tenant pin is yours to get right.** The broker requires every provider to have an `Admit` permit, but knows no issuer's tenant claim by name.
 - **One signing key at a time.** Rotating it can't publish the old and new keys side by side, so a token signed just before the rotation fails at a service that has already refetched the JWKS. They're short-lived, and the caller can exchange again.
 - **No JWT replay cache.** A stolen JWT can be exchanged again until it expires. The custom audience and its short lifetime limit this.
 - **Resource IDs aren't checked up front.** Apart from the account check, a wrong zone ID is only caught when Cloudflare rejects the mint (`503`).
@@ -540,9 +592,10 @@ The crate is laid out as cloudflare-nix's Worker is:
 | | |
 |---|---|
 | `src/lib.rs` | The start, fetch and scheduled events: the JSON logger, the configuration, then the SDK's two routers over it, the token endpoints under the auth layer and the discovery endpoints under `cache_publicly`, and the health endpoints, all under `OAuthResponseLayer`. |
-| `src/service/config.rs` | The bindings, read in `Config::from_env` only, and the policy's format: providers, profiles, claim sets, bucket prefixes, and the guardrails parsing checks. |
-| `src/oidc/` | OIDC tokens in the Worker, verified and signed: the JWT format (RFC 7515, 7519, 9068), providers found by `iss` with their keys from the issuer's metadata (RFC 7517, 8414, OpenID Connect Discovery), the claim rules, and RS256 through the runtime's WebCrypto, for verifying and for signing the broker's own tokens. |
-| `src/service/layer.rs` | Exchange auth, as a tower layer over `oidc`: the subject token's provider by `iss`, RS256 against the issuer's keys with WebCrypto, the standard claims and the provider's claim sets. And `OAuthResponseLayer`, OAuth's rules for every response: the generated validation's refusals as `invalid_request`, and `Cache-Control: no-store`; `cache_publicly`, the discovery endpoints' `public, max-age=300`. |
+| `src/service/config.rs` | The bindings and the policy from KV, read in `Config::load` only, and the configuration's format: providers, profiles, bucket prefixes, and the guardrails parsing checks. |
+| `src/service/authz.rs` | The Cedar half of the policy: parsing it, checking it against the configuration, and asking it who may be admitted and who gets which profile. |
+| `src/oidc/` | OIDC tokens in the Worker, verified and signed: the JWT format (RFC 7515, 7519, 9068), providers found by `iss` with their keys from the issuer's metadata (RFC 7517, 8414, OpenID Connect Discovery), and RS256 through the runtime's WebCrypto, for verifying and for signing the broker's own tokens. |
+| `src/service/layer.rs` | Exchange auth, as a tower layer over `oidc`: the subject token's provider by `iss`, RS256 against the issuer's keys with WebCrypto, the standard claims, and whether the policy admits it. And `OAuthResponseLayer`, OAuth's rules for every response: the generated validation's refusals as `invalid_request`, and `Cache-Control: no-store`; `cache_publicly`, the discovery endpoints' `public, max-age=300`. |
 | `src/service/handler.rs` | The generated API's implementation, a handler per trait. `TokenServiceHandler`: the exchange (profiles, Cloudflare tokens and R2 credentials through [cloudflare-rs](https://github.com/cf-contrib/cloudflare-rs), the broker's own tokens), revocation, and the cleanup the cron runs. `DiscoveryServiceHandler`: the RFC 8414 and OpenID Connect Discovery metadata, and the keys. |
 
 ## Development

@@ -145,7 +145,16 @@ where
             let policy = config.policy();
             let accepted = SendFuture::new(async {
                 let (provider, jwt) = policy.providers.verify(&token).await?;
-                provider.claims.authorize(&jwt.claims)
+                let verdict = policy.admit(&provider.name, &jwt.claims);
+                if verdict.allowed {
+                    Ok(())
+                } else {
+                    Err(oidc::Error::InsufficientScope {
+                        issuer: jwt.claims.iss().unwrap_or_default().to_string(),
+                        subject: jwt.claims.sub().map(String::from),
+                        policies: verdict.policies,
+                    })
+                }
             });
             match accepted.await {
                 Ok(_) => inner.call(req).await,
@@ -175,17 +184,22 @@ fn deny(policy: &PolicyConfig, err: oidc::Error) -> Response {
             let body = v1::Error::new(ErrorCode::InvalidRequest, message);
             (StatusCode::BAD_REQUEST, body)
         }
-        oidc::Error::InsufficientScope { issuer, subject } => {
+        oidc::Error::InsufficientScope {
+            issuer,
+            subject,
+            policies,
+        } => {
             // Named as the policy names it.
             let provider = policy
                 .providers
                 .find(&issuer)
                 .map_or(issuer.as_str(), |provider| provider.name.as_str());
-            let message = format!("the token matches none of provider {provider}'s claim sets");
+            let message = format!("the policy doesn't admit the token to provider {provider}");
             warn!(
                 event = "token.deny",
                 provider,
                 sub = subject,
+                policies = ?policies,
                 error = "invalid_request",
                 %message,
             );

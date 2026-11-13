@@ -39,7 +39,7 @@ The action and the broker, with its Terraform module, are released together from
 
 People on their own machines use [cf-vault](https://github.com/cf-contrib/cf-vault): it signs in through your identity provider, trades the ID token at this broker, runs a command with the credentials and revokes the token when it exits. This repository no longer ships a command-line client.
 
-The broker takes OIDC tokens from any issuer you list: GitHub Actions, GitLab CI, HCP Terraform, or, for people, an identity provider such as [Cloudflare Access](crates/cloudflare-sts-api#people). Who gets what is in the policy's claim sets, the same rules [cloudflare-nix](https://github.com/cf-contrib/cloudflare-nix) uses.
+The broker takes OIDC tokens from any issuer you list: GitHub Actions, GitLab CI, HCP Terraform, or, for people, an identity provider such as [Cloudflare Access](crates/cloudflare-sts-api#people). Who gets what is in a [Cedar](https://www.cedarpolicy.com) policy, and what each profile hands out in a TOML configuration.
 
 Other services can trust the broker too. A profile with an `audience` gets the caller a short-lived token the broker signs itself, for that service, which verifies it with the broker's published keys. [cloudflare-nix](https://github.com/cf-contrib/cloudflare-nix) is the first such service. See [Tokens for other services](crates/cloudflare-sts-api#tokens-for-other-services).
 
@@ -56,7 +56,7 @@ sequenceDiagram
     OIDC-->>Job: JWT
     Job->>Broker: 2. POST /oauth/token (RFC 8693, the JWT as subject_token)
     Broker->>OIDC: metadata and keys (cached)
-    Broker->>Broker: 3. verify the JWT, match the policy's claim sets, pick the profile
+    Broker->>Broker: 3. verify the JWT, check the Cedar policy, pick the profile
     Broker->>CF: 4. look up permission groups, create the token (expires_on)
     CF-->>Broker: token
     Broker-->>Job: access_token, token_id, account_id

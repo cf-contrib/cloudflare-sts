@@ -179,7 +179,7 @@ impl TokenServiceHandler {
             provider = %provider.name,
             profile = %profile.name,
             sub = identity.claims.sub(),
-            claims = %serde_json::Value::Object(provider.matched_claims(Some(profile), &identity.claims)),
+            claims = %serde_json::Value::Object(profile.forwarded_claims(&identity.claims)),
             audience = %profile.audience,
             jti = %signed.jti,
             expires_at,
@@ -207,8 +207,7 @@ impl TokenServiceHandler {
         ttl: u64,
     ) -> Result<TokenExchangeResponse, Error> {
         let account_id = self.config.cloudflare().account_id();
-        let claims =
-            serde_json::Value::Object(provider.matched_claims(Some(profile), &identity.claims));
+        let claims = serde_json::Value::Object(profile.forwarded_claims(&identity.claims));
 
         // Filled in before anything is minted, so an unusable claim leaves
         // nothing behind.
@@ -468,7 +467,7 @@ impl TokenServiceApi for TokenServiceHandler {
                     .map_err(|why| invalid_request(&why))?;
                 let (identity, provider) = &*caller.insert((identity, provider));
 
-                let profile = policy
+                let (profile, allowed_by) = policy
                     .profile_for(
                         &provider.name,
                         &identity.claims,
@@ -477,6 +476,13 @@ impl TokenServiceApi for TokenServiceHandler {
                     )
                     .map_err(|why| invalid_request(&why))?;
                 named = Some(profile);
+                info!(
+                    event = "policy.allow",
+                    provider = %provider.name,
+                    profile = %profile.name,
+                    sub = identity.claims.sub(),
+                    policies = ?allowed_by,
+                );
                 let ttl = profile
                     .ttl_for(request.ttl.as_deref())
                     .map_err(|why| invalid_request(&why))?;
@@ -507,8 +513,8 @@ impl TokenServiceApi for TokenServiceHandler {
                         provider = caller.as_ref().map(|(_, provider)| provider.name.as_str()),
                         profile,
                         sub = caller.as_ref().and_then(|(identity, _)| identity.claims.sub()),
-                        claims = caller.as_ref().map(|(identity, provider)| {
-                            display(serde_json::Value::Object(provider.matched_claims(named, &identity.claims)))
+                        claims = caller.as_ref().zip(named).map(|((identity, _), profile)| {
+                            display(serde_json::Value::Object(profile.forwarded_claims(&identity.claims)))
                         }),
                         error = err.error.as_str(),
                         message = %err.error_description,
@@ -785,8 +791,8 @@ fn missing(what: &str) -> Error {
 /// caller doesn't authenticate as a client, and it's the provider that says
 /// who it is.
 ///
-/// It has the claims the policy matched on, under the issuer's names, so the
-/// service can match on the same ones. Nothing else: an issuer's other claims,
+/// It has the claims the profile forwards, under the issuer's names, so the
+/// service can match on them. Nothing else: an issuer's other claims,
 /// such as an email, stay behind. Signing adds its `jti`.
 fn payload(
     issuer: &str,
@@ -808,7 +814,7 @@ fn payload(
         ));
     }
 
-    let mut other = provider.matched_claims(Some(profile), claims);
+    let mut other = profile.forwarded_claims(claims);
     for (name, value) in [
         ("provider", json!(provider.name)),
         ("profile", json!(profile.name)),
@@ -867,7 +873,7 @@ mod tests {
     }
 
     #[test]
-    fn copies_only_the_claims_the_policy_matches_on() {
+    fn copies_only_the_claims_the_profile_forwards() {
         let policy = parse(&policy());
         let (provider, profile) = (&policy.providers[0], &policy.profiles[1]);
         let mut matched = claims();

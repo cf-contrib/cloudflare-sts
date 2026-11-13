@@ -8,6 +8,8 @@ authors = ["iamralch"]
 crate-type = ["cdylib"]
 
 [dependencies]
+cedar-policy = { version = "4", default-features = false }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 # `http` hands `fetch` an http::Request, which the SDK's axum router takes.
 worker = { version = "0.8", features = ["http", "axum"] }
 
