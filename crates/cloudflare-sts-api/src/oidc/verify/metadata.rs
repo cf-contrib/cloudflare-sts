@@ -5,7 +5,7 @@
 use serde::Deserialize;
 
 use super::keys::{check_url, fetch_json};
-use crate::Error;
+use crate::oidc::Error;
 
 /// The `jwks_uri` in `issuer`'s metadata: its OpenID Provider Metadata, or,
 /// when it publishes none, its Authorization Server Metadata.

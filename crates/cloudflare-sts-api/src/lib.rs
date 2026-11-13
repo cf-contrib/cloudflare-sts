@@ -13,6 +13,7 @@
 //!
 //! The hourly cron deletes the expired tokens the broker minted.
 
+mod oidc;
 mod service;
 
 use std::sync::Arc;

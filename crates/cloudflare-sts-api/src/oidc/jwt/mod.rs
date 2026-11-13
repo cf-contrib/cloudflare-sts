@@ -10,11 +10,11 @@ use serde_json::{Map, Value};
 pub(crate) use self::claims::LEEWAY_SECS;
 pub use self::{
     claims::{AccessTokenClaims, Claims},
-    header::{ALGORITHM, AT_JWT, Header, JWT},
+    header::{ALGORITHM, AT_JWT, Header},
 };
-use crate::{Error, error::invalid};
+use crate::oidc::{Error, error::invalid};
 
-/// A JWT that [`Providers::verify`](crate::Providers::verify) accepted: its signature checked
+/// A JWT that [`Providers::verify`](crate::oidc::Providers::verify) accepted: its signature checked
 /// against its issuer's keys, and its registered claims validated.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Jwt {

@@ -10,7 +10,7 @@ use worker::{
     wasm_bindgen_futures::JsFuture,
 };
 
-use crate::{ALGORITHM, KeyError};
+use crate::oidc::{ALGORITHM, KeyError};
 
 /// Whether `signature` is the RS256 signature of `signing_input` by the RSA
 /// public key `n` and `e`, base64url. A signature WebCrypto refuses to check,

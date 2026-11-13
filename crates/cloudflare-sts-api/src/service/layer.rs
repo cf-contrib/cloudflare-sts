@@ -3,7 +3,7 @@
 //!
 //! [`AuthenticateLayer`] is layered over the token endpoints in the crate root.
 //! Every token exchange needs an OIDC token from a provider the policy names,
-//! as its `subject_token`. The layer verifies it with [`cloudflare_sts_core`] before
+//! as its `subject_token`. The layer verifies it with [`oidc`] before
 //! the request reaches the handler, and refuses the exchange if it isn't
 //! valid, or none of its provider's claim sets matches: `invalid_request`, or
 //! `temporarily_unavailable` when the issuer's keys can't be had. An exchange
@@ -11,7 +11,7 @@
 //! Revocation passes straight through: holding the token is its proof.
 //!
 //! The handler takes the caller's verified token from
-//! [`cloudflare_sts_core::verified`], by the token as sent: never by decoding it
+//! [`oidc::verified`], by the token as sent: never by decoding it
 //! itself, so a token the layer didn't verify gets nothing.
 //!
 //! [`OAuthResponseLayer`] is layered over everything: it gives the generated
@@ -45,6 +45,7 @@ use super::{
     config::{Config, PolicyConfig},
     handler::TOKEN_EXCHANGE,
 };
+use crate::oidc;
 
 /// Where the token exchange is.
 const TOKEN_PATH: &str = "/oauth/token";
@@ -163,18 +164,18 @@ fn form_field(body: &[u8], name: &str) -> Option<String> {
         .map(|(_, value)| value)
 }
 
-/// Denies an exchange whose token `cloudflare_sts_core` didn't accept, with why
+/// Denies an exchange whose token [`oidc`] didn't accept, with why
 /// logged, and returned unless it's an issuer's fault. A subject token that
 /// isn't valid, or that the policy doesn't take, is `invalid_request` (RFC
 /// 8693 §2.2.2).
-fn deny(policy: &PolicyConfig, err: cloudflare_sts_core::Error) -> Response {
+fn deny(policy: &PolicyConfig, err: oidc::Error) -> Response {
     let (status, body) = match err {
-        cloudflare_sts_core::Error::InvalidToken(message) => {
+        oidc::Error::InvalidToken(message) => {
             warn!(event = "token.deny", error = "invalid_request", %message);
             let body = v1::Error::new(ErrorCode::InvalidRequest, message);
             (StatusCode::BAD_REQUEST, body)
         }
-        cloudflare_sts_core::Error::InsufficientScope { issuer, subject } => {
+        oidc::Error::InsufficientScope { issuer, subject } => {
             // Named as the policy names it.
             let provider = policy
                 .providers
@@ -191,7 +192,7 @@ fn deny(policy: &PolicyConfig, err: cloudflare_sts_core::Error) -> Response {
             let body = v1::Error::new(ErrorCode::InvalidRequest, message);
             (StatusCode::BAD_REQUEST, body)
         }
-        cloudflare_sts_core::Error::TemporarilyUnavailable(message) => {
+        oidc::Error::TemporarilyUnavailable(message) => {
             warn!(event = "token.deny", error = "temporarily_unavailable", %message);
             let body = v1::Error::new(
                 ErrorCode::TemporarilyUnavailable,

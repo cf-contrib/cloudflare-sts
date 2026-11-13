@@ -44,9 +44,9 @@ mod jwt;
 mod sign;
 mod verify;
 
-pub use crate::{
+pub use crate::oidc::{
     error::{Error, KeyError},
-    jwt::{ALGORITHM, AT_JWT, AccessTokenClaims, Claims, Header, JWT, Jwt},
-    sign::{SignedToken, SigningKey},
-    verify::{ClaimRule, ClaimRules, Provider, Providers, check_url, verified},
+    jwt::{ALGORITHM, AT_JWT, AccessTokenClaims, Claims, Header, Jwt},
+    sign::SigningKey,
+    verify::{ClaimRules, Provider, Providers, check_url, verified},
 };

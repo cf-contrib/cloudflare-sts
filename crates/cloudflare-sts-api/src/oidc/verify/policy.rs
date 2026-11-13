@@ -1,13 +1,13 @@
 //! The policy: what a JWT's claims must be to be let in. Ours, not any
 //! RFC's: [`ClaimRules::authorize`] applies it to a token
-//! [`Providers::verify`](crate::Providers::verify) accepted.
+//! [`Providers::verify`](crate::oidc::Providers::verify) accepted.
 
 use std::{collections::BTreeMap, ops::Deref};
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::{Claims, Error};
+use crate::oidc::{Claims, Error};
 
 /// The claim rules a token must match one of: a provider's, or anything else
 /// a configuration lets a token in by. Written as a JSON array of

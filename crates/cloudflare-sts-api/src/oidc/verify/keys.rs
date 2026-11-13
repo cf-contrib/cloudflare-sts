@@ -8,7 +8,7 @@ use serde::{Deserialize, de::DeserializeOwned};
 use worker::{AbortSignal, Fetch, Method, Request};
 
 use super::metadata;
-use crate::{ALGORITHM, Error, crypto, error::invalid};
+use crate::oidc::{ALGORITHM, Error, crypto, error::invalid};
 
 /// How long a fetched JWK Set is trusted before it's fetched again.
 const JWKS_TTL_MS: u64 = 10 * 60 * 1000;
@@ -57,7 +57,7 @@ const FETCH_TIMEOUT_MS: u32 = 10 * 1000;
 /// Whether `url` is somewhere keys may be fetched from: HTTPS, or plain HTTP
 /// on a loopback address, for a local issuer in development. For checking
 /// other URLs in a configuration the same way;
-/// [`Providers::check`](crate::Providers::check) checks providers'.
+/// [`Providers::check`](crate::oidc::Providers::check) checks providers'.
 ///
 /// # Errors
 ///
