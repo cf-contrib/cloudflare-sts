@@ -1,6 +1,6 @@
 //! End-to-end tests of the Worker under `wrangler dev`, with the OIDC issuers
 //! and Cloudflare replaced by the stand-ins in `helper`, and the policy in
-//! `wrangler.toml`. Run with `tests/run.sh`.
+//! `tests/policy.json`. Run with `tests/run.sh`.
 
 #![cfg(feature = "integration")]
 

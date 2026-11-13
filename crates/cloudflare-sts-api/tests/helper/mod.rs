@@ -1,6 +1,6 @@
 //! The integration tests' world: stand-ins for the OIDC issuers and
 //! Cloudflare's API, served from the test process. The Worker's policy is in
-//! `wrangler.toml`. All IDs, tokens and keys are made up.
+//! `tests/policy.json`. All IDs, tokens and keys are made up.
 
 #![allow(dead_code)]
 

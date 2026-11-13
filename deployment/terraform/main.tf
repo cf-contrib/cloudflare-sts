@@ -27,7 +27,7 @@ resource "cloudflare_worker" "this" {
 }
 
 locals {
-  # The policy, as the broker reads it from CLOUDFLARE_STS_API_POLICY. The
+  # The policy, as the broker reads it from the policy key of its KV namespace. The
   # module fills in what the deployment decides, and leaves out what's unset:
   # the broker takes a missing field, not a null one.
   policy = merge(
@@ -48,7 +48,22 @@ locals {
   policy_json = jsonencode(local.policy)
 }
 
-# Upload a new version on every artifact, policy or binding change.
+# The policy lives in Workers KV, not in a Worker variable (5 KB at most), so it
+# can be as long as it needs to be. The Worker reads it on a miss and holds it
+# for a minute: a change takes effect within about two, with no new version.
+resource "cloudflare_workers_kv_namespace" "policy" {
+  account_id = var.account_id
+  title      = "${var.worker_name}-policy"
+}
+
+resource "cloudflare_workers_kv" "policy" {
+  account_id   = var.account_id
+  namespace_id = cloudflare_workers_kv_namespace.policy.id
+  key_name     = "policy"
+  value        = local.policy_json
+}
+
+# Upload a new version on every artifact or binding change.
 resource "cloudflare_worker_version" "this" {
   account_id         = var.account_id
   worker_id          = cloudflare_worker.this.id
@@ -59,11 +74,6 @@ resource "cloudflare_worker_version" "this" {
     precondition {
       condition     = local.release_ok
       error_message = "The release's files don't match its SHA256SUMS, or SHA256SUMS doesn't match checksums_sha256."
-    }
-
-    precondition {
-      condition     = length(local.policy_json) <= 5120
-      error_message = "The policy is ${length(local.policy_json)} bytes as JSON; a Worker variable holds at most 5 KB."
     }
   }
 
@@ -87,9 +97,9 @@ resource "cloudflare_worker_version" "this" {
       text = var.account_id
     },
     {
-      name = "CLOUDFLARE_STS_API_POLICY"
-      type = "plain_text"
-      text = local.policy_json
+      name         = "CLOUDFLARE_STS_API_POLICY_KV"
+      type         = "kv_namespace"
+      namespace_id = cloudflare_workers_kv_namespace.policy.id
     },
     {
       # Only ever from Secrets Store, so the token never enters Terraform state.
@@ -114,6 +124,9 @@ resource "cloudflare_workers_deployment" "this" {
   account_id  = var.account_id
   script_name = cloudflare_worker.this.name
   strategy    = "percentage"
+
+  # The policy is there before the first request: without it every one is a 500.
+  depends_on = [cloudflare_workers_kv.policy]
 
   versions = [
     {

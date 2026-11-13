@@ -166,9 +166,13 @@ the plan.
 
 A policy kept in a file still works: `profiles = yamldecode(file("${path.module}/policy.yaml")).profiles`.
 
-The policy is bound as `CLOUDFLARE_STS_API_POLICY`, compact JSON. A Worker
-variable holds at most 5 KB, and the plan fails on a policy over that. Every
-policy change creates a new Worker version.
+The policy is compact JSON under the key `policy` of a Workers KV namespace
+the module creates, bound as `CLOUDFLARE_STS_API_POLICY_KV`. It has no size
+limit to speak of, so 50 repos' profiles fit. A policy change updates the key
+and creates no Worker version, and takes effect within about two minutes: the
+Worker holds it for a minute, and KV's edge cache can add another. It doesn't
+roll back with the Worker. To cut off access at once, revoke the Cloudflare
+token. See the [broker's README](../../crates/cloudflare-sts-api#bindings).
 
 ## People
 
