@@ -1,7 +1,7 @@
 # Plans the module with mocked providers: no credentials or network needed.
 # Covers the Cloudflare token binding, URL modes, the release and local artifacts, their
 # checksums, and the policy the module builds from its variables: what it fills
-# in, what it leaves out, and its size.
+# in, what it leaves out, and that it's kept in KV, so its size is no limit.
 mock_provider "cloudflare" {}
 mock_provider "github" {}
 mock_provider "http" {} # the release downloads, overridden below
@@ -139,9 +139,14 @@ run "policy_is_built_from_the_variables" {
   assert {
     condition = anytrue([
       for b in cloudflare_worker_version.this.bindings :
-      b.name == "CLOUDFLARE_STS_API_POLICY" && b.type == "plain_text" && b.text == local.policy_json
+      b.name == "CLOUDFLARE_STS_API_POLICY_KV" && b.type == "kv_namespace"
     ])
-    error_message = "the policy should be a plain_text binding"
+    error_message = "the policy should be bound as a KV namespace"
+  }
+
+  assert {
+    condition     = cloudflare_workers_kv.policy.key_name == "policy" && cloudflare_workers_kv.policy.value == local.policy_json
+    error_message = "the policy should be stored under the key `policy`, as JSON"
   }
 
   assert {
@@ -229,7 +234,7 @@ run "rejects_a_profile_without_claims" {
   expect_failures = [var.profiles]
 }
 
-run "rejects_a_policy_over_5_kb" {
+run "accepts_a_policy_over_5_kb" {
   command = plan
 
   variables {
@@ -245,7 +250,10 @@ run "rejects_a_policy_over_5_kb" {
     ]
   }
 
-  expect_failures = [cloudflare_worker_version.this]
+  assert {
+    condition     = length(local.policy_json) > 5120
+    error_message = "the test policy should be over what a Worker variable holds"
+  }
 }
 
 run "workers_dev" {
