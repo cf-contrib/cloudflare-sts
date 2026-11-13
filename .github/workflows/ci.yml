@@ -42,10 +42,6 @@ jobs:
         run: nix develop --command cargo fmt --all --check
       - name: Test Rust
         run: nix develop --command cargo test --workspace
-      # The CLI as people install it, which also checks the flake's hash of the
-      # workspace's git dependencies.
-      - name: Build CLI
-        run: nix build .#default
       - name: Build Rust Worker
         working-directory: crates/cloudflare-sts-api
         run: nix develop --command worker-build --release

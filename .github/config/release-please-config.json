@@ -13,13 +13,7 @@
         "README.md",
         "action/README.md",
         "deployment/terraform/README.md",
-        "deployment/terraform/variables.tf",
-        "crates/cloudflare-sts-cli/Cargo.toml",
-        {
-          "type": "toml",
-          "path": "Cargo.lock",
-          "jsonpath": "$.package[?(@.name.value=='cloudflare-sts-cli')].version"
-        }
+        "deployment/terraform/variables.tf"
       ]
     }
   }

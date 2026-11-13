@@ -739,7 +739,7 @@ mod people {
     /// its ID tokens' audience.
     const CLIENT_ID: &str = "test-access-client-id";
 
-    /// An ID token from the `access` stand-in for `email`, as the CLI's login
+    /// An ID token from the `access` stand-in for `email`, as cf-vault's login
     /// gets one.
     fn id_token(email: &str) -> String {
         let claims = json!({ "sub": "user-0001", "email": email, "name": "Alice" });

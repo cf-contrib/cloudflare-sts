@@ -26,39 +26,8 @@
         };
 
         rust-toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
-        cli = (pkgs.lib.importTOML ./crates/cloudflare-sts-cli/Cargo.toml).package;
       in
       {
-        # The CLI, for people: `nix profile install github:cf-contrib/cloudflare-sts`.
-        # A personal tool, like gh, not a dependency of the repos it's used in.
-        packages.default = pkgs.rustPlatform.buildRustPackage {
-          pname = cli.name;
-          inherit (cli) version;
-          src = pkgs.lib.cleanSource ./.;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            # The Worker's Cloudflare client, which the workspace's lock file
-            # holds though the CLI doesn't use it.
-            outputHashes."cloudflare-0.1.0" = "sha256-e0BWzgtSwRL48FAoiXOzMhbY04C5SDw9FJFE1xy8w54=";
-          };
-          cargoBuildFlags = [
-            "--package"
-            cli.name
-          ];
-          # The tests run in CI, with the rest of the workspace's.
-          doCheck = false;
-          # nixpkgs builds the -sys crates against the libraries of the system, since its November release, and aws-lc-sys finds none: it builds its own,
-          # as it did
-          dontCargoUseSystemLibs = true;
-          meta = {
-            inherit (cli) description;
-            homepage = "https://github.com/cf-contrib/cloudflare-sts";
-            license = pkgs.lib.licenses.mit;
-            mainProgram = "cloudflare-sts";
-            platforms = pkgs.lib.platforms.unix;
-          };
-        };
-
         devShells.default = pkgs.mkShell {
           name = "cloudflare-sts";
           packages = [

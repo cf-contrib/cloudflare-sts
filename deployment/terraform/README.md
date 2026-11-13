@@ -172,7 +172,7 @@ policy change creates a new Worker version.
 
 ## People
 
-People sign in to the [CLI](../../crates/cloudflare-sts-cli) through an
+People sign in with [cf-vault](https://github.com/cf-contrib/cf-vault) through an
 identity provider that issues them an ID token. For Cloudflare Access, the
 [`saas-oidc`](https://github.com/tf-contrib/terraform-cloudflare-access/tree/main/modules/saas-oidc)
 module of terraform-cloudflare-access creates the application, a public client
@@ -186,7 +186,7 @@ module "cloudflare_access_saas_oidc" {
   account_id    = var.account_id
   team_name     = "example" # example.cloudflareaccess.com
   name          = "cloudflare-sts"
-  redirect_uris = ["http://127.0.0.1:8250/callback"] # where the CLI listens
+  redirect_uris = ["http://127.0.0.1:8250/callback"] # where cf-vault listens
   emails        = ["alice@example.com", "bob@example.com"]
 }
 
@@ -217,9 +217,24 @@ module "cloudflare_sts_api" {
 The provider's one claim set pins the application's own issuer; the profiles
 name the people, by `email`. Then, on each person's machine:
 
+```toml
+# ~/.config/cf-vault/config.toml
+[people]
+type = "oauth2"
+account_id = "<account id>"
+
+[people.oauth2]
+# Access accepts offline_access (a refresh token) but does not list it
+scopes = ["openid", "email", "offline_access"]
+
+[people.oauth2.exchange]
+url = "https://cloudflare-sts-api.example.com"
+profile = "infra-admins:tofu-plan"
+```
+
 ```sh
-cloudflare-sts login --url https://cloudflare-sts-api.example.com
-cloudflare-sts exec --url https://cloudflare-sts-api.example.com --profile infra-admins:tofu-plan -- tofu plan
+cf-vault login -p people
+cf-vault exec -p people -- tofu plan
 ```
 
 Access decides who can sign in; the broker's profiles decide what each person
