@@ -484,3 +484,35 @@ run "profiles_of_any_shape" {
     error_message = "nested resources should reach the policy beside flat ones"
   }
 }
+
+run "profile_with_an_access" {
+  command = plan
+
+  # An Access service token for an application, beside a token, or alone.
+  variables {
+    profiles = [
+      {
+        name   = "nix"
+        access = { audience = "https://nix.example.com" }
+      },
+      {
+        name = "deploy-and-nix"
+        token = { policies = [{
+          permissions = ["Workers Scripts Write"]
+          resources   = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
+        }] }
+        access = { audience = "https://nix.example.com" }
+      },
+    ]
+  }
+
+  assert {
+    condition     = jsondecode(local.config_json).profiles[0].access.audience == "https://nix.example.com"
+    error_message = "an access should reach the policy unchanged"
+  }
+
+  assert {
+    condition     = jsondecode(local.config_json).profiles[1].access.audience == "https://nix.example.com" && length(jsondecode(local.config_json).profiles[1].token.policies) == 1
+    error_message = "an access should reach the policy beside a token"
+  }
+}

@@ -90,3 +90,30 @@ export async function idToken(audience, { attempts = 3, delay = 500 } = {}) {
     await sleep(delay * 2 ** (i - 1));
   }
 }
+
+/**
+ * Waits until Access admits a new service token: Cloudflare takes a few seconds to honor
+ * one, and a request before that is turned away at the edge with a 302 or a 403. Asks the
+ * application itself, once a `interval`, for at most `timeout`. Never fails: false says it
+ * wasn't seen, and the job goes on, whose own requests are then the test.
+ * @param {string} audience @param {string} clientId @param {string} clientSecret
+ * @param {{ timeout?: number, interval?: number }} [options]
+ */
+export async function waitUntilAdmitted(audience, clientId, clientSecret, { timeout = 15_000, interval = 1_000 } = {}) {
+  const deadline = Date.now() + timeout;
+  for (;;) {
+    try {
+      const response = await fetch(audience, {
+        headers: { "cf-access-client-id": clientId, "cf-access-client-secret": clientSecret },
+        redirect: "manual",
+        signal: AbortSignal.timeout(10_000),
+      });
+      await response.body?.cancel();
+      if (response.status !== 302 && response.status !== 403) return true;
+    } catch {
+      // A network blip: ask again until the deadline.
+    }
+    if (Date.now() + interval > deadline) return false;
+    await sleep(interval);
+  }
+}

@@ -1,8 +1,8 @@
 # cloudflare-sts action
 
 > The GitHub Action half of [cloudflare-sts](..): exchange the job's OIDC token for
-> a short-lived Cloudflare API token and/or R2 credentials, export them, and revoke
-> the token when the job ends.
+> a short-lived Cloudflare API token, R2 credentials and/or an Access service token,
+> export them, and revoke the token when the job ends.
 
 [![CI](https://github.com/cf-contrib/cloudflare-sts/actions/workflows/ci.yml/badge.svg)](https://github.com/cf-contrib/cloudflare-sts/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
@@ -61,6 +61,7 @@ A floating `v1` tag will follow each release from 1.0 on.
   - masks the token and the OIDC token;
   - exports `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` for the rest of the job. For a profile with only a `bucket` there's no token, and only `CLOUDFLARE_ACCOUNT_ID` is exported;
   - when the profile has a `bucket`, also exports its [S3 credentials](#r2-over-the-s3-api) as `CLOUDFLARE_R2_*`, and masks the secret and session token;
+  - when the profile has an `access`, also exports its [Access service token](#access-service-tokens) as `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`, masks the secret, and waits (at most 15 seconds) until Access honors it;
   - logs the token ID, profile and expiry (none of them secret), so a run can be matched to the broker's audit log:
 
     ```
@@ -68,7 +69,7 @@ A floating `v1` tag will follow each release from 1.0 on.
     cloudflare-sts: issued R2 credentials for bucket org-terraform-state under 100000001/200000003/ (scope example-org:terraform-state, expires 2026-09-28T12:15:00Z)
     ```
 
-- **Post step:** revokes the token, if there is one. It runs even when the job fails. A failed revoke is a warning, not an error: the token expires on its own and the broker's cron deletes it. R2 credentials can't be revoked; the post step logs when they expire:
+- **Post step:** revokes the token, and the Access service token, if there are any. It runs even when the job fails. A failed revoke is a warning, not an error: the token expires on its own and the broker's cron deletes it. R2 credentials can't be revoked; the post step logs when they expire:
 
   ```
   cloudflare-sts: R2 temporary credentials can't be revoked; they expire at 2026-09-28T12:15:00Z
@@ -104,6 +105,31 @@ None of this can be switched off: what's exported is decided by the profile. Exp
     ttl: 30m
 - run: tofu apply -auto-approve # the cloudflare provider reads CLOUDFLARE_API_TOKEN
 ```
+
+### Access service tokens
+
+When the matched profile has an [`access`](../crates/cloudflare-sts-api#access-service-tokens), the broker creates an Access service token for that application. The action exports it, so the job can call an application behind Cloudflare Access:
+
+| Variable                  | Value                      |
+| ------------------------- | -------------------------- |
+| `CF_ACCESS_CLIENT_ID`     | the client ID (not masked) |
+| `CF_ACCESS_CLIENT_SECRET` | the client secret, masked  |
+
+```yaml
+- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+  with:
+    url: https://cloudflare-sts-api.example.com
+    scopes: example-org/app:ci.nix
+- run: |
+    curl -fsS https://nix.example.com/nix-cache-info \
+      -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+      -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET"
+```
+
+- **A few seconds to take effect.** Cloudflare takes 1 to 3 seconds to honor a new token, so the action waits, by asking the application with it until Access stops answering `302` or `403`. It gives up after 15 seconds with a warning and the job goes on. An application that itself answers `403` to everyone delays the job by that long.
+- **One application per profile,** like a bucket. A request for several scopes may name only one profile with an `access`.
+- **Revoked at job end** by the token's ID. A token lasts at least 10 minutes if the job dies first.
+- **Not for Nix itself.** Nix can't send these headers: use [nix-vault](https://github.com/nixos-contrib/nix-vault) with a `basic` profile whose `username_env` and `password_env` name these two variables, delivered through its local proxy.
 
 ### R2 over the S3 API
 

@@ -17,15 +17,26 @@ export const STUB_BUCKET = {
   endpoint: `https://${STUB_ACCOUNT_ID}.r2.cloudflarestorage.com`,
   expires_on: "2026-09-28T12:15:00Z",
 };
+export const STUB_ACCESS = {
+  token_id: "stub-access-token-id",
+  client_id: "stub-client-id.access",
+  client_secret: "stub-client-secret",
+  expires_on: "2026-09-28T12:15:00Z",
+};
 const ACCESS_TOKEN = "urn:ietf:params:oauth:token-type:access_token";
+const ACCESS_SERVICE_TOKEN = "urn:cloudflare-sts:params:oauth:token-type:access_service_token";
 const R2_CREDENTIALS = "urn:cloudflare-sts:params:oauth:token-type:r2_credentials";
 /** A profile the stub answers as one with only a bucket: no token, just STUB_BUCKET. */
 export const STUB_R2_PROFILE = "smoke-r2";
+/** A profile the stub answers as one with only an Access service token, for the stub itself as the application. */
+export const STUB_ACCESS_PROFILE = "smoke-access";
 
 /**
  * @typedef {{ method: string, path: string, authorization?: string, body?: unknown }} Call
- * @param {{ port?: number, tokenStatus?: number, revokeStatus?: number, oidcStatuses?: number[], tokenFields?: Record<string, unknown> }} [options]
+ * @param {{ port?: number, tokenStatus?: number, revokeStatus?: number, oidcStatuses?: number[], tokenFields?: Record<string, unknown>, accessRefusals?: number }} [options]
  *   `tokenFields` overrides fields of the 200 token response; `undefined` removes one.
+ *   `accessRefusals` is how many requests with a service token the stub, as the application, turns away with a 403
+ *   before it admits them: Cloudflare takes a moment to honor a new one.
  */
 export function startStub({
   port = 0,
@@ -33,7 +44,9 @@ export function startStub({
   revokeStatus = 200,
   oidcStatuses = [],
   tokenFields = {},
+  accessRefusals = 0,
 } = {}) {
+  let refusals = accessRefusals;
   /** @type {Call[]} */
   const calls = [];
   const oidc = [...oidcStatuses];
@@ -77,6 +90,17 @@ export function startStub({
       if (body?.scope === STUB_R2_PROFILE) {
         return send(200, { ...r2, scope: STUB_R2_PROFILE, bucket: STUB_BUCKET, ...tokenFields });
       }
+      if (body?.scope === STUB_ACCESS_PROFILE) {
+        return send(200, {
+          ...expires,
+          issued_token_type: ACCESS_SERVICE_TOKEN,
+          token_type: "N_A",
+          account_id: STUB_ACCOUNT_ID,
+          scope: STUB_ACCESS_PROFILE,
+          access: { ...STUB_ACCESS, audience: `http://${req.headers.host}` },
+          ...tokenFields,
+        });
+      }
       return send(200, {
         access_token: STUB_TOKEN,
         issued_token_type: ACCESS_TOKEN,
@@ -90,7 +114,12 @@ export function startStub({
     }
     if (req.method === "POST" && url.pathname === "/oauth/revoke") {
       if (!body?.token) return send(400, { error: "invalid_request", error_description: "stub" });
-      return send(body.token === STUB_TOKEN ? revokeStatus : 200);
+      return send(body.token === STUB_TOKEN || body.token === STUB_ACCESS.token_id ? revokeStatus : 200);
+    }
+    // The application the stub stands in for: Access turns a request away until it honors the token.
+    if (req.method === "GET" && url.pathname === "/") {
+      if (!req.headers["cf-access-client-id"] || refusals-- > 0) return send(403);
+      return send(200, { ok: true });
     }
     send(404);
   });

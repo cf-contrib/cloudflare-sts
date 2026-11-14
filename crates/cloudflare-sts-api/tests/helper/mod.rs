@@ -354,6 +354,21 @@ pub async fn revoke(token: Option<&str>) -> Reply {
     }
 }
 
+/// Revokes an Access service token by its ID.
+pub async fn revoke_access(id: &str) -> Reply {
+    post_form(
+        "/oauth/revoke",
+        &[
+            ("token", id),
+            (
+                "token_type_hint",
+                "urn:cloudflare-sts:params:oauth:token-type:access_service_token",
+            ),
+        ],
+    )
+    .await
+}
+
 /// Verifies a token the broker signed with the keys it publishes, and returns
 /// its header and claims.
 pub async fn verify_broker_token(jwt: &str) -> (Value, Value) {
@@ -480,12 +495,25 @@ pub struct CloudflareRequest {
     pub body: Option<Value>,
 }
 
-/// Cloudflare's account tokens API, permission groups and R2 temporary credentials, in memory.
+#[derive(Clone, Debug)]
+pub struct StoredServiceToken {
+    pub id: String,
+    pub name: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub expires_at: String,
+    pub duration: String,
+    pub tags: Value,
+}
+
+/// Cloudflare's account tokens API, permission groups, R2 temporary credentials and Access service tokens, in memory.
 pub struct FakeCloudflare {
     pub tokens: BTreeMap<String, StoredToken>,
+    pub service_tokens: BTreeMap<String, StoredServiceToken>,
     pub requests: Vec<CloudflareRequest>,
     pub fail_create: bool,
     pub fail_r2: bool,
+    pub fail_access: bool,
     seq: u32,
 }
 
@@ -518,9 +546,11 @@ impl FakeCloudflare {
     fn new() -> Self {
         let mut fake = Self {
             tokens: BTreeMap::new(),
+            service_tokens: BTreeMap::new(),
             requests: Vec::new(),
             fail_create: false,
             fail_r2: false,
+            fail_access: false,
             seq: 0,
         };
         fake.add(
@@ -558,6 +588,26 @@ impl FakeCloudflare {
         };
         self.tokens.insert(id, token.clone());
         token
+    }
+
+    /// Adds an Access service token, expiring at `expires_at`.
+    pub fn add_service_token(&mut self, name: &str, expires_at: String) -> StoredServiceToken {
+        self.seq += 1;
+        let token = StoredServiceToken {
+            id: format!("svc-{}", self.seq),
+            name: name.into(),
+            client_id: format!("client-{}.access", self.seq),
+            client_secret: format!("secret-{}", self.seq),
+            expires_at,
+            duration: String::new(),
+            tags: json!({}),
+        };
+        self.service_tokens.insert(token.id.clone(), token.clone());
+        token
+    }
+
+    fn service_view(token: &StoredServiceToken) -> Value {
+        json!({ "id": token.id, "name": token.name, "client_id": token.client_id, "expires_at": token.expires_at, "duration": token.duration, "tags": token.tags })
     }
 
     /// Requests other than the permission-group list, which the Worker caches.
@@ -622,6 +672,58 @@ impl FakeCloudflare {
             let mut created = Self::view(&token);
             created["value"] = json!(token.value);
             return envelope(created);
+        }
+        if path == format!("{acct}/access/service_tokens") && method == Method::POST {
+            if self.fail_access {
+                return api_error(500, "Internal Server Error");
+            }
+            let body = body.unwrap_or_default();
+            // Cloudflare refuses less than 10 minutes.
+            let seconds = body["duration"]
+                .as_str()
+                .and_then(|d| d.strip_suffix('s'))
+                .and_then(|d| d.parse::<u64>().ok())
+                .unwrap_or(0);
+            if seconds < 600 {
+                return api_error(
+                    400,
+                    "access.api.error.service_token_invalid_expiration: must be greater than or equal to 10m",
+                );
+            }
+            let at = chrono::DateTime::from_timestamp((now() + seconds) as i64, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let mut token = self.add_service_token(body["name"].as_str().unwrap_or_default(), at);
+            token.duration = body["duration"].as_str().unwrap_or_default().into();
+            token.tags = body["tags"].clone();
+            self.service_tokens.insert(token.id.clone(), token.clone());
+            let mut created = Self::service_view(&token);
+            created["client_secret"] = json!(token.client_secret);
+            return envelope(created);
+        }
+        if path == format!("{acct}/access/service_tokens") && method == Method::GET {
+            let page = query
+                .get("page")
+                .and_then(|p| p.parse::<f64>().ok())
+                .unwrap_or(1.0);
+            let all: Vec<Value> = self
+                .service_tokens
+                .values()
+                .map(Self::service_view)
+                .collect();
+            return envelope(if page > 1.0 { json!([]) } else { json!(all) });
+        }
+        if let Some(id) = path.strip_prefix(&format!("{acct}/access/service_tokens/")) {
+            let Some(token) = self.service_tokens.get(id).cloned() else {
+                return api_error(404, "Not found");
+            };
+            if method == Method::GET {
+                return envelope(Self::service_view(&token));
+            }
+            if method == Method::DELETE {
+                self.service_tokens.remove(id);
+                return envelope(Self::service_view(&token));
+            }
         }
         if method == Method::POST && path == format!("{acct}/r2/temp-access-credentials") {
             let body = body.unwrap_or_default();

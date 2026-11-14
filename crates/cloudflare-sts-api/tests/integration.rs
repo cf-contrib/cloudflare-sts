@@ -1292,3 +1292,179 @@ mod several_scopes {
         assert!(world().cloudflare.calls().is_empty());
     }
 }
+
+mod access_service_tokens {
+    use super::*;
+
+    const HOST: &str = "cloudflare-nix-api.example.com";
+
+    /// A job in the environment the `combo-*` profiles are for.
+    fn combo() -> String {
+        sign(github_claims(json!({ "environment": "combo" })))
+    }
+
+    fn service_tokens() -> usize {
+        world().cloudflare.service_tokens.len()
+    }
+
+    #[tokio::test]
+    async fn issues_a_service_token_tagged_with_the_applications_host() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-access")]).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        let body = res.json();
+
+        // Only a service token: no API token, no bucket
+        assert_eq!(
+            body["issued_token_type"],
+            "urn:cloudflare-sts:params:oauth:token-type:access_service_token"
+        );
+        assert!(body.get("access_token").is_none() && body.get("bucket").is_none());
+        assert_eq!(token_count(), 1);
+
+        let access = &body["access"];
+        assert_eq!(access["audience"], format!("https://{HOST}"));
+        let world = world();
+        let stored = world
+            .cloudflare
+            .service_tokens
+            .get(access["token_id"].as_str().unwrap())
+            .expect("the service token exists");
+        assert_eq!(access["client_id"], stored.client_id.as_str());
+        assert_eq!(access["client_secret"], stored.client_secret.as_str());
+        assert!(
+            stored.name.starts_with("cloudflare-sts:github:"),
+            "{}",
+            stored.name
+        );
+        // What an Access `service_token_tag` rule matches
+        assert_eq!(stored.tags, json!({ "cloudflare-sts-audience": HOST }));
+        // The profile's 15 minutes
+        assert_eq!(stored.duration, "900s");
+    }
+
+    #[tokio::test]
+    async fn gives_a_service_token_at_least_the_ten_minutes_cloudflare_does() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-access"), ("ttl", "1m")]).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        let world = world();
+        let stored = world.cloudflare.service_tokens.values().next().unwrap();
+        assert_eq!(stored.duration, "600s");
+    }
+
+    #[tokio::test]
+    async fn combines_with_a_token_in_one_grant() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-deploy combo-access")]).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        let body = res.json();
+        assert_eq!(body["scope"], "combo-deploy combo-access");
+        assert!(body["access_token"].is_string() && body["access"]["client_id"].is_string());
+        assert_eq!(
+            body["issued_token_type"],
+            "urn:ietf:params:oauth:token-type:access_token"
+        );
+        assert_eq!((token_count(), service_tokens()), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn refuses_two_applications_without_calling_cloudflare() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-access combo-access-two")]).await;
+        assert_eq!(res.status, 400);
+        assert_error(&res, "invalid_scope");
+        assert!(world().cloudflare.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deletes_the_token_when_the_service_token_cant_be_created() {
+        let t = start().await;
+        world().cloudflare.fail_access = true;
+        let res = job_token(&combo(), &[("scope", "combo-deploy combo-access")]).await;
+        assert_eq!(res.status, 503);
+        assert_error(&res, "temporarily_unavailable");
+        // Half a grant isn't handed out: the API token was deleted
+        assert_eq!((token_count(), service_tokens()), (1, 0));
+        assert_matches(
+            &t.audit("token.revoke").await.unwrap(),
+            json!({ "reason": "discarded" }),
+        );
+        assert!(t.audits("access.issued").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn writes_an_audit_line_without_the_secret() {
+        let t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-access")]).await;
+        let body = res.json();
+        let line = t
+            .audit("access.issued")
+            .await
+            .expect("an access.issued line");
+        assert_matches(
+            &line,
+            json!({
+                "profile": "combo-access",
+                "audience": format!("https://{HOST}"),
+                "token_id": body["access"]["token_id"],
+            }),
+        );
+        let text = line.to_string();
+        let secret = body["access"]["client_secret"].as_str().unwrap();
+        assert!(!text.contains(secret), "the secret is in the log: {text}");
+    }
+
+    #[tokio::test]
+    async fn revokes_a_service_token_by_its_id() {
+        let _t = start().await;
+        let issued = job_token(&combo(), &[("scope", "combo-access")])
+            .await
+            .json();
+        let id = issued["access"]["token_id"].as_str().unwrap();
+        let res = revoke_access(id).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        assert_eq!(service_tokens(), 0);
+        // Again, or one that never was: still 200, RFC 7009's
+        assert_eq!(revoke_access(id).await.status, 200);
+        assert_eq!(revoke_access("nope").await.status, 200);
+        // An ID that isn't one is never put in a path
+        assert_eq!(revoke_access("../tokens").await.status, 200);
+    }
+
+    #[tokio::test]
+    async fn doesnt_revoke_a_service_token_the_broker_didnt_mint() {
+        let _t = start().await;
+        let foreign = world()
+            .cloudflare
+            .add_service_token("someone else's", "2099-01-01T00:00:00Z".into());
+        let res = revoke_access(&foreign.id).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        assert!(world().cloudflare.service_tokens.contains_key(&foreign.id));
+    }
+
+    #[tokio::test]
+    async fn the_scheduled_cleanup_deletes_only_expired_broker_service_tokens() {
+        let _t = start().await;
+        let at = |offset: i64| {
+            chrono::DateTime::from_timestamp(now() as i64 + offset, 0)
+                .unwrap()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        let (expired, live, foreign) = {
+            let mut world = world();
+            let cf = &mut world.cloudflare;
+            (
+                cf.add_service_token("cloudflare-sts:github:1", at(-60)),
+                cf.add_service_token("cloudflare-sts:github:2", at(300)),
+                cf.add_service_token("someone else's", at(-60)),
+            )
+        };
+        let res = call(Method::GET, "/__scheduled?cron=17+*+*+*+*").await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        let world = world();
+        assert!(!world.cloudflare.service_tokens.contains_key(&expired.id));
+        assert!(world.cloudflare.service_tokens.contains_key(&live.id));
+        assert!(world.cloudflare.service_tokens.contains_key(&foreign.id));
+    }
+}

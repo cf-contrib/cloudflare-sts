@@ -35,17 +35,19 @@ use cloudflare::v4::{
     R2TempAccessCredsRequestPermission,
 };
 use cloudflare_sts_sdk::v1::{
-    self, AuthorizationServerMetadata, BucketCredentials, DiscoveryServiceApi, Error, ErrorCode,
-    IdentityProvider, IssuedTokenType, Jwks, OpenIdProviderMetadata, TokenExchangeRequest,
-    TokenExchangeRequestSubjectTokenType as SubjectTokenType, TokenExchangeResponse,
-    TokenExchangeResponseTokenType as TokenType, TokenRevocationRequest, TokenServiceApi,
+    self, AccessCredentials, AuthorizationServerMetadata, BucketCredentials, DiscoveryServiceApi,
+    Error, ErrorCode, IdentityProvider, IssuedTokenType, Jwks, OpenIdProviderMetadata,
+    TokenExchangeRequest, TokenExchangeRequestSubjectTokenType as SubjectTokenType,
+    TokenExchangeResponse, TokenExchangeResponseTokenType as TokenType, TokenRevocationRequest,
+    TokenRevocationRequestTokenTypeHint, TokenServiceApi,
 };
 use serde_json::json;
 use tracing::{error, info, warn};
 use worker::{Date, send::SendFuture};
 
 use super::config::{
-    BucketPermission, CLOUDFLARE_AUDIENCE, Config, ProfileConfig, ProviderConfig, Refusal,
+    AccessConfig, BucketPermission, CLOUDFLARE_AUDIENCE, Config, ProfileConfig, ProviderConfig,
+    Refusal,
 };
 use crate::oidc::{self, AccessTokenClaims, Jwt, SigningKey};
 
@@ -148,6 +150,44 @@ impl TokenServiceHandler {
                 Err(err) => return Err(upstream("tokens.delete", err)),
             }
         }
+
+        // The Access service tokens, the same way: the broker's by name,
+        // once they've lapsed. Cloudflare may remove them itself.
+        let access = self.config.cloudflare();
+        let mut lapsed = Vec::new();
+        for page in 1.. {
+            let tokens = access
+                .list_service_tokens(page, PAGE_SIZE)
+                .await
+                .map_err(|why| access_upstream("accessServiceTokens.list", why))?;
+            let count = tokens.len();
+            for token in tokens {
+                let expired = token
+                    .expires_at
+                    .is_some_and(|at| at.timestamp() <= now as i64);
+                if expired && token.name.starts_with(TOKEN_PREFIX) {
+                    lapsed.push(token);
+                }
+            }
+            if count < PAGE_SIZE {
+                break;
+            }
+        }
+        for token in lapsed {
+            match access.delete_service_token(&token.id).await {
+                Ok(true) => {
+                    deleted += 1;
+                    info!(
+                        event = "token.cleanup",
+                        kind = "access",
+                        token_id = %token.id,
+                        name = %token.name,
+                    );
+                }
+                Ok(false) => {}
+                Err(why) => return Err(access_upstream("accessServiceTokens.delete", why)),
+            }
+        }
         Ok(deleted)
     }
 
@@ -187,6 +227,7 @@ impl TokenServiceHandler {
             expires_at,
         );
         Ok(TokenExchangeResponse {
+            access: None,
             access_token: Some(signed.jwt),
             account_id: None,
             bucket: None,
@@ -344,20 +385,8 @@ impl TokenServiceHandler {
             match r2.await {
                 Ok(credentials) => Some(credentials),
                 Err(err) => {
-                    // Best effort: the cleanup is the fallback.
                     if let Some((token_id, _, _)) = &token {
-                        match cloudflare
-                            .accounts_tokens_delete(account_id, token_id)
-                            .await
-                        {
-                            Ok(_) => info!(event = "token.revoke", token_id, reason = "discarded"),
-                            Err(err) => error!(
-                                event = "token.revoke",
-                                token_id,
-                                reason = "discard_failed",
-                                detail = %err,
-                            ),
-                        }
+                        discard_token(&cloudflare, account_id, token_id).await;
                     }
                     return Err(err);
                 }
@@ -366,10 +395,59 @@ impl TokenServiceHandler {
             None
         };
 
-        let expires_at = token
-            .as_ref()
-            .map_or(expires_on, |(_, _, at)| *at)
-            .timestamp();
+        // The service token comes last: it's the one nothing here can delete
+        // again but the cleanup, so only the API token, which is discarded
+        // with it, is behind it.
+        let access = match &profile.access {
+            None => None,
+            Some(config) => {
+                let mut tags = serde_json::Map::new();
+                tags.insert(AccessConfig::TAG.into(), config.host().into());
+                let created = self
+                    .config
+                    .cloudflare()
+                    .create_service_token(
+                        &token_name(provider, identity),
+                        ttl / 1000,
+                        &serde_json::Value::Object(tags),
+                    )
+                    .await;
+                match created {
+                    Ok(created) => {
+                        info!(
+                            event = "access.issued",
+                            provider = %provider.name,
+                            profile = %profile.name,
+                            sub = identity.claims.sub(),
+                            claims = %claims,
+                            audience = %config.audience,
+                            token_id = %created.id,
+                            expires_at = created.expires_at.timestamp(),
+                        );
+                        Some((config, created))
+                    }
+                    Err(why) => {
+                        if let Some((token_id, _, _)) = &token {
+                            discard_token(&cloudflare, account_id, token_id).await;
+                        }
+                        return Err(Error::new(
+                            ErrorCode::TemporarilyUnavailable,
+                            format!("Cloudflare: accessServiceTokens.create: {why}"),
+                        ));
+                    }
+                }
+            }
+        };
+
+        // What expires first is what the response says: the token's, or else
+        // the bucket's, or else the service token's.
+        let expires_at = match (&token, &issued, &access) {
+            (Some((_, _, at)), ..) => *at,
+            (None, Some(_), _) | (None, None, None) => expires_on,
+            (None, None, Some((_, created))) => created.expires_at,
+        }
+        .timestamp();
+        let has_bucket = issued.is_some();
         let (access_token, token_id, issued_token_type, token_type) = match token {
             Some((id, value, _)) => (
                 Some(value),
@@ -380,11 +458,22 @@ impl TokenServiceHandler {
             None => (
                 None,
                 None,
-                IssuedTokenType::UrnCloudflareStsParamsOauthTokenTypeR2Credentials,
+                if has_bucket || access.is_none() {
+                    IssuedTokenType::UrnCloudflareStsParamsOauthTokenTypeR2Credentials
+                } else {
+                    IssuedTokenType::UrnCloudflareStsParamsOauthTokenTypeAccessServiceToken
+                },
                 TokenType::NA,
             ),
         };
         Ok(TokenExchangeResponse {
+            access: access.map(|(config, created)| AccessCredentials {
+                audience: config.audience.clone(),
+                client_id: created.client_id,
+                client_secret: created.client_secret,
+                expires_on: created.expires_at,
+                token_id: created.id,
+            }),
             access_token,
             account_id: Some(account_id.into()),
             bucket: issued,
@@ -395,6 +484,23 @@ impl TokenServiceHandler {
             token_id,
             token_type,
         })
+    }
+}
+
+/// Deletes a Cloudflare API token that's being given up on. Best effort: the
+/// cleanup is the fallback.
+async fn discard_token(cloudflare: &HttpClient, account_id: &str, token_id: &str) {
+    match cloudflare
+        .accounts_tokens_delete(account_id, token_id)
+        .await
+    {
+        Ok(_) => info!(event = "token.revoke", token_id, reason = "discarded"),
+        Err(err) => error!(
+            event = "token.revoke",
+            token_id,
+            reason = "discard_failed",
+            detail = %err,
+        ),
     }
 }
 
@@ -431,6 +537,7 @@ impl TokenServiceApi for TokenServiceHandler {
                         t,
                         IssuedTokenType::UrnIetfParamsOauthTokenTypeAccessToken
                             | IssuedTokenType::UrnCloudflareStsParamsOauthTokenTypeR2Credentials
+                            | IssuedTokenType::UrnCloudflareStsParamsOauthTokenTypeAccessServiceToken
                     ),
                     (false, Some(t)) => matches!(
                         t,
@@ -566,6 +673,35 @@ impl TokenServiceApi for TokenServiceHandler {
             // and it's deleted if the broker minted it. Cloudflare doesn't
             // recognize one invalid, expired, deleted or another account's.
             let revoked = async {
+                // An Access service token is revoked by its ID: Cloudflare
+                // won't say a secret is right, so the ID, which only the job
+                // that was issued it has, is the proof. It's deleted if the
+                // broker minted it, by its name.
+                if request.token_type_hint
+                    == Some(
+                        TokenRevocationRequestTokenTypeHint::UrnCloudflareStsParamsOauthTokenTypeAccessServiceToken,
+                    )
+                {
+                    let id = request.token.as_str();
+                    // An ID is a UUID: anything else isn't a token, and isn't
+                    // put in a path.
+                    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                        return Ok(RevokeStatus::Gone);
+                    }
+                    let access = self.config.cloudflare();
+                    let name = match access.get_service_token(id).await {
+                        Ok(Some(token)) => token.name,
+                        Ok(None) => return Ok(RevokeStatus::Gone),
+                        Err(why) => return Err(access_upstream("accessServiceTokens.get", why)),
+                    };
+                    if !name.starts_with(TOKEN_PREFIX) {
+                        return Ok(RevokeStatus::NotMinted(id.into()));
+                    }
+                    return match access.delete_service_token(id).await {
+                        Ok(_) => Ok(RevokeStatus::Deleted(id.into())),
+                        Err(why) => Err(access_upstream("accessServiceTokens.delete", why)),
+                    };
+                }
                 let account_id = self.config.cloudflare().account_id();
                 let presenter = self.config.cloudflare().client_as(&request.token);
                 let status = |err: &ApiOpError<_>| err.api().map(|api| api.status);
@@ -788,6 +924,14 @@ fn upstream<E: std::fmt::Debug>(what: &str, err: ApiOpError<E>) -> Error {
 
 /// A Cloudflare API answer without what it should have had, reported as
 /// [`upstream`] reports a failure.
+/// An Access service token call that failed: what Cloudflare said.
+fn access_upstream(what: &str, why: String) -> Error {
+    Error::new(
+        ErrorCode::TemporarilyUnavailable,
+        format!("Cloudflare: {what}: {why}"),
+    )
+}
+
 fn missing(what: &str) -> Error {
     Error::new(
         ErrorCode::TemporarilyUnavailable,

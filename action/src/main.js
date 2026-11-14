@@ -2,7 +2,7 @@
 /** @typedef {import("./api.js").TokenExchangeRequest} TokenExchangeRequest */
 /** @typedef {import("./api.js").TokenExchangeResponse} TokenExchangeResponse */
 /** @typedef {import("./api.js").Error} BrokerError */
-import { brokerURL, fail, idToken, input, mask, write } from "./runner.js";
+import { brokerURL, fail, idToken, input, mask, waitUntilAdmitted, warning, write } from "./runner.js";
 
 /** Hints for the errors a misconfigured workflow or policy usually produces, by OAuth error code. */
 const HINTS = /** @type {Record<string, string>} */ ({
@@ -85,8 +85,12 @@ try {
       throw new Error("cloudflare-sts broker returned an invalid response: missing bucket.prefixes");
     }
   }
-  if (t.access_token === undefined && b === undefined) {
-    throw new Error("cloudflare-sts broker returned an invalid response: missing token and bucket");
+  const a = t.access;
+  if (a !== undefined) {
+    requireStrings(a, ["token_id", "client_id", "client_secret", "audience", "expires_on"], "access.");
+  }
+  if (t.access_token === undefined && b === undefined && a === undefined) {
+    throw new Error("cloudflare-sts broker returned an invalid response: missing token, bucket and access");
   }
 
   write("GITHUB_ENV", "CLOUDFLARE_ACCOUNT_ID", t.account_id);
@@ -117,6 +121,20 @@ try {
     console.log(
       `cloudflare-sts: issued R2 credentials for bucket ${b.name}${scope} (scope ${t.scope}, expires ${b.expires_on})`,
     );
+  }
+
+  if (a !== undefined) {
+    mask(a.client_secret);
+    write("GITHUB_ENV", "CF_ACCESS_CLIENT_ID", a.client_id);
+    write("GITHUB_ENV", "CF_ACCESS_CLIENT_SECRET", a.client_secret);
+    write("GITHUB_STATE", "access_token_id", a.token_id);
+    console.log(
+      `cloudflare-sts: issued an Access service token for ${a.audience} (scope ${t.scope}, expires ${a.expires_on})`,
+    );
+    // Cloudflare takes a few seconds to honor it: the job's first request would be turned away.
+    if (!(await waitUntilAdmitted(a.audience, a.client_id, a.client_secret))) {
+      warning(`cloudflare-sts: Access hasn't admitted the service token for ${a.audience} yet; the job goes on`);
+    }
   }
 } catch (err) {
   fail(err);

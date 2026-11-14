@@ -43,13 +43,21 @@ enum Versions {
 }
 
 model TokenRevocationRequest {
-  /** The Cloudflare API token, as the exchange returned it in `access_token`. */
+  /**
+   * The Cloudflare API token, as the exchange returned it in `access_token`; or, with
+   * the `access_service_token` hint, the service token's ID (`access.token_id`).
+   */
   @minLength(1)
   @maxLength(8192)
   token: string;
 
-  /** If sent, `access_token`, and ignored: only Cloudflare API tokens the broker minted can be revoked. */
-  token_type_hint?: "access_token";
+  /**
+   * `access_token` (the default, and ignored), or the `access_service_token` URN to
+   * revoke an Access service token. Only what the broker minted can be revoked.
+   */
+  token_type_hint?:
+    | "access_token"
+    | "urn:cloudflare-sts:params:oauth:token-type:access_service_token";
 }
 
 model TokenExchangeRequest {
@@ -100,12 +108,14 @@ model TokenExchangeRequest {
 
 /**
  * What the exchange issues: a Cloudflare API token (`access_token`), R2 credentials
- * alone (`r2_credentials`), or the broker's own JWT access token for a service
- * (`access_token`, or `jwt` if asked for by that name).
+ * alone (`r2_credentials`), an Access service token alone (`access_service_token`), or
+ * the broker's own JWT access token for a service (`access_token`, or `jwt` if asked
+ * for by that name).
  */
 union IssuedTokenType {
   "urn:ietf:params:oauth:token-type:access_token",
   "urn:cloudflare-sts:params:oauth:token-type:r2_credentials",
+  "urn:cloudflare-sts:params:oauth:token-type:access_service_token",
   "urn:ietf:params:oauth:token-type:jwt",
 }
 
@@ -117,7 +127,10 @@ model TokenExchangeResponse {
    */
   access_token?: string;
 
-  /** `access_token` with an `access_token`, `r2_credentials` without one, or `jwt` as asked for. */
+  /**
+   * `access_token` with an `access_token`; without one, `r2_credentials` with a bucket or
+   * else `access_service_token`; or `jwt` as asked for.
+   */
   issued_token_type: IssuedTokenType;
 
   /** `Bearer` with an `access_token`, or `N_A` without one (RFC 8693 §2.2.1). */
@@ -141,6 +154,28 @@ model TokenExchangeResponse {
 
   /** The R2 credentials, for a profile with a bucket. */
   bucket?: BucketCredentials;
+
+  /** The Access service token, for a profile with `access`. */
+  access?: AccessCredentials;
+}
+
+/**
+ * A Cloudflare Access service token for the profile's `access.audience`: sent as the
+ * `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers. It's created for the job
+ * and deleted by revoking it. Cloudflare takes a moment, a few seconds, to honor a
+ * new one.
+ */
+model AccessCredentials {
+  /** The service token's ID, which revoking it takes. */
+  token_id: string;
+
+  client_id: string;
+  client_secret: string;
+
+  /** The application the token is for: the profile's `access.audience`. */
+  audience: string;
+
+  expires_on: utcDateTime;
 }
 
 /** S3 credentials for the profile's R2 bucket, limited to `prefixes`. They can't be revoked; they expire. */

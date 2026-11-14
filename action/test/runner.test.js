@@ -3,7 +3,8 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { brokerURL, idToken, input, write } from "../src/runner.js";
+import { brokerURL, idToken, input, waitUntilAdmitted, write } from "../src/runner.js";
+import { startStub } from "./stub.js";
 
 beforeEach(() => {
   vi.stubEnv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://runner.example.com/token?api-version=2.0");
@@ -92,4 +93,25 @@ describe("brokerURL", () => {
       expect(() => brokerURL(url)).toThrow();
     },
   );
+});
+
+describe("waitUntilAdmitted", () => {
+  it("asks until the application stops turning the token away", async () => {
+    const stub = await startStub({ accessRefusals: 2 });
+    try {
+      expect(await waitUntilAdmitted(stub.url, "id", "secret", { interval: 5 })).toBe(true);
+      expect(stub.calls.filter((c) => c.path === "/")).toHaveLength(3);
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it("gives up after the timeout, and says so", async () => {
+    const stub = await startStub({ accessRefusals: 1000 });
+    try {
+      expect(await waitUntilAdmitted(stub.url, "id", "secret", { timeout: 40, interval: 10 })).toBe(false);
+    } finally {
+      await stub.close();
+    }
+  });
 });

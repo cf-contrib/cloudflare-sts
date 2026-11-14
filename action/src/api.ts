@@ -13,6 +13,7 @@ export type SubjectTokenType = "urn:ietf:params:oauth:token-type:id_token" | "ur
 export type IssuedTokenType =
   | "urn:ietf:params:oauth:token-type:access_token"
   | "urn:cloudflare-sts:params:oauth:token-type:r2_credentials"
+  | "urn:cloudflare-sts:params:oauth:token-type:access_service_token"
   | "urn:ietf:params:oauth:token-type:jwt";
 
 /**
@@ -54,6 +55,8 @@ export interface TokenExchangeResponse {
   account_id?: string;
   scope: string;
   bucket?: BucketCredentials;
+  /** The Access service token, for a profile with `access`. */
+  access?: AccessCredentials;
 }
 
 /**
@@ -63,8 +66,26 @@ export interface TokenExchangeResponse {
  */
 export interface TokenRevocationRequest {
   token: string;
-  /** Ignored, as RFC 7009 allows: only Cloudflare API tokens the broker minted can be revoked. */
-  token_type_hint?: "access_token" | undefined;
+  /**
+   * `access_token` (the default, and ignored): only Cloudflare API tokens the broker minted
+   * can be revoked. With the `access_service_token` URN, `token` is the service token's ID.
+   */
+  token_type_hint?: "access_token" | "urn:cloudflare-sts:params:oauth:token-type:access_service_token" | undefined;
+}
+
+/**
+ * A Cloudflare Access service token for `audience`, sent as the `CF-Access-Client-Id` and
+ * `CF-Access-Client-Secret` headers. Cloudflare takes a few seconds to honor a new one.
+ */
+export interface AccessCredentials {
+  /** The service token's ID, which revoking it takes. */
+  token_id: string;
+  client_id: string;
+  client_secret: string;
+  /** The application the token is for. */
+  audience: string;
+  /** RFC 3339 timestamp. */
+  expires_on: string;
 }
 
 /** S3 credentials for the profile's R2 bucket, limited to `prefixes`. They can't be revoked; they expire. */
@@ -89,6 +110,7 @@ export interface BucketCredentials {
 export type ErrorCode =
   | "invalid_request"
   | "invalid_target"
+  | "invalid_scope"
   | "unsupported_grant_type"
   | "server_error"
   | "temporarily_unavailable";

@@ -84,6 +84,14 @@ when { context.environment == "state-and-deploy" };
 permit (principal, action == Profile::Action::"owner-state", resource)
 when { context.environment == "owner-state" };
 
+@id("allow-combo-access")
+permit (principal, action == Profile::Action::"combo-access", resource)
+when { context.environment == "combo" };
+
+@id("allow-combo-access-two")
+permit (principal, action == Profile::Action::"combo-access-two", resource)
+when { context.environment == "combo" };
+
 @id("allow-nix-push")
 permit (principal, action == Profile::Action::"nix-push", resource)
 when { context.ref == "refs/heads/main" };
