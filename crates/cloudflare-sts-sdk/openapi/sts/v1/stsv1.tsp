@@ -15,11 +15,9 @@ using Versioning;
  * as RFC 8693 and RFC 7009 have it. Every response is `Cache-Control: no-store`, but
  * the discovery endpoints' `200`s.
  *
- * Exchanges an OIDC token for short-lived Cloudflare credentials, or for an access token
- * the broker signs for another service (RFC 8693 token exchange at `POST /oauth/token`;
- * RFC 9068), and revokes Cloudflare tokens (RFC 7009 at `POST /oauth/revoke`). Services
- * find the keys to verify the broker's tokens through its metadata (RFC 8414, or OpenID
- * Connect Discovery for those that only read that).
+ * Exchanges an OIDC token for short-lived Cloudflare credentials (RFC 8693 token exchange
+ * at `POST /oauth/token`), and revokes them (RFC 7009 at `POST /oauth/revoke`). Clients
+ * find the endpoints through its metadata (RFC 8414).
  */
 @service(#{ title: "cloudflare-sts" })
 @server("https://cloudflare-sts-api.example.com")
@@ -32,7 +30,7 @@ using Versioning;
 @tagMetadata(
   "DiscoveryService",
   #{
-    description: "The broker's metadata and keys, public, for the services that verify its tokens.",
+    description: "The broker's metadata, public, for clients that find its endpoints.",
   }
 )
 @versioned(Versions)
@@ -74,26 +72,16 @@ model TokenExchangeRequest {
     | "urn:ietf:params:oauth:token-type:jwt";
 
   /**
-   * `https://api.cloudflare.com` for Cloudflare credentials, or the URL of a service
-   * the policy issues the broker's own tokens for. Empty is `invalid_request`.
-   */
-  @maxLength(200)
-  audience?: string = "https://api.cloudflare.com";
-
-  /**
-   * Checked against the audience, not used to choose: what's issued is what the profile
-   * has. For Cloudflare's audience, `access_token` or `r2_credentials`; for a
-   * service's, `jwt` or `access_token`, two names for the same JWT. Any other is
-   * `invalid_target`.
+   * Checked, not used to choose: what's issued is what the profile has. `access_token`,
+   * `r2_credentials` or `access_service_token`. Any other is `invalid_target`.
    */
   requested_token_type?: IssuedTokenType;
 
   /**
    * The profiles to get, as a space-delimited list (RFC 6749 §3.3, RFC 8693 §2.1). The
    * caller must be allowed every one, or the request is `invalid_scope` and nothing is
-   * issued. Profiles for the Cloudflare audience are combined into one grant: their token
-   * policies together, and at most one bucket. A profile for another service's audience
-   * can't be combined. If omitted, exactly one profile must match.
+   * issued. Profiles are combined into one grant: their token policies together, and at
+   * most one bucket and one access. If omitted, exactly one profile must match.
    */
   @maxLength(1024)
   scope?: string;
@@ -108,28 +96,23 @@ model TokenExchangeRequest {
 
 /**
  * What the exchange issues: a Cloudflare API token (`access_token`), R2 credentials
- * alone (`r2_credentials`), an Access service token alone (`access_service_token`), or
- * the broker's own JWT access token for a service (`access_token`, or `jwt` if asked
- * for by that name).
+ * alone (`r2_credentials`), or an Access service token alone (`access_service_token`).
  */
 union IssuedTokenType {
   "urn:ietf:params:oauth:token-type:access_token",
   "urn:cloudflare-sts:params:oauth:token-type:r2_credentials",
   "urn:cloudflare-sts:params:oauth:token-type:access_service_token",
-  "urn:ietf:params:oauth:token-type:jwt",
 }
 
 model TokenExchangeResponse {
   /**
-   * The Cloudflare API token, absent for a profile with only a bucket; or, for a
-   * service's audience, the JWT access token (RFC 9068, `typ` `at+jwt`) the broker
-   * signed.
+   * The Cloudflare API token, absent for a profile with only a bucket or an access.
    */
   access_token?: string;
 
   /**
    * `access_token` with an `access_token`; without one, `r2_credentials` with a bucket or
-   * else `access_service_token`; or `jwt` as asked for.
+   * else `access_service_token`.
    */
   issued_token_type: IssuedTokenType;
 
@@ -146,7 +129,7 @@ model TokenExchangeResponse {
   /** The Cloudflare API token's ID, present with `access_token`. */
   token_id?: string;
 
-  /** The Cloudflare account, for the Cloudflare audience. */
+  /** The Cloudflare account. */
   account_id?: string;
 
   /** The profiles that were granted, space-delimited (RFC 8693 §2.2.1). */
@@ -199,7 +182,6 @@ model AuthorizationServerMetadata {
   /** Exactly the `iss` of the broker's tokens, so no trailing slash. */
   issuer: string;
 
-  jwks_uri: url;
   token_endpoint: url;
   revocation_endpoint: url;
 
@@ -214,35 +196,6 @@ model AuthorizationServerMetadata {
 
   /** `none`: holding the token is the proof. */
   revocation_endpoint_auth_methods_supported?: string[];
-}
-
-/** OpenID Provider Metadata (OpenID Connect Discovery 1.0 §3), without an authorization endpoint. */
-model OpenIdProviderMetadata {
-  /** Exactly the `iss` of the broker's tokens, so no trailing slash. */
-  issuer: string;
-
-  jwks_uri: url;
-
-  /** `id_token`, as GitHub's and Kubernetes' issuers say, since Discovery requires one. */
-  response_types_supported: string[];
-
-  /** `public`: `sub` is the caller's `sub` from its issuer, the same for every service. */
-  subject_types_supported: string[];
-
-  /** `RS256`, what the broker signs its tokens with. */
-  id_token_signing_alg_values_supported: string[];
-}
-
-/** A JWK Set (RFC 7517 §5): the broker's RSA public key, or none without a signing key. */
-model Jwks {
-  keys: {
-    kty: "RSA";
-    n: string;
-    e: string;
-    kid: string;
-    alg: "RS256";
-    use: "sig";
-  }[];
 }
 
 /** An OAuth error response (RFC 6749 §5.2). */
@@ -323,8 +276,8 @@ interface TokenService {
    * apply follows the policy: every profile named in `scope` must match the caller,
    * otherwise exactly one profile must. Anything unsupported, such as `actor_token`, is
    * refused rather than ignored. An invalid subject token, or one the policy doesn't take,
-   * is `invalid_request`, as RFC 8693 §2.2.2 has it; an `audience` the broker issues
-   * nothing for is `invalid_target`, and a `scope` that names an unknown profile, or one
+   * is `invalid_request`, as RFC 8693 §2.2.2 has it; a `requested_token_type` the broker
+   * doesn't issue is `invalid_target`, and a `scope` that names an unknown profile, or one
    * the caller can't have, or profiles that can't be combined, is `invalid_scope`.
    */
   @summary("Exchange an OIDC token for a Cloudflare API token and/or R2 credentials.")
@@ -356,37 +309,11 @@ interface TokenService {
 @tag("DiscoveryService")
 interface DiscoveryService {
   /** Tokens come from exchange only, so there's no authorization endpoint. */
-  @summary("The broker's Authorization Server Metadata (RFC 8414), with its keys and endpoints.")
+  @summary("The broker's Authorization Server Metadata (RFC 8414), with its endpoints.")
   @operationId("metadata")
   @route("/.well-known/oauth-authorization-server")
   @get
   getMetadata():
     | Ok<AuthorizationServerMetadata, "The metadata. Cacheable for 5 minutes.">
-    | InternalServerError;
-
-  /**
-   * For services that find an issuer's keys only through OpenID Connect Discovery, such
-   * as AWS IAM, Google Cloud Workload Identity Federation and Vault. The broker isn't a
-   * full OpenID Provider: tokens come from exchange only, so there's no authorization
-   * endpoint. As GitHub's and Kubernetes' issuers do, it publishes what verifying its
-   * tokens takes, and the members Discovery requires.
-   */
-  @summary("The broker's OpenID Provider Metadata (OpenID Connect Discovery 1.0), with its keys.")
-  @operationId("openidConfiguration")
-  @route("/.well-known/openid-configuration")
-  @get
-  openidConfiguration():
-    | Ok<OpenIdProviderMetadata, "The metadata. Cacheable for 5 minutes.">
-    | InternalServerError;
-
-  @summary("The public key the broker signs its own tokens with.")
-  @operationId("jwks")
-  @route("/.well-known/jwks")
-  @get
-  jwks():
-    | Ok<
-        Jwks,
-        "A JWK Set. Empty when no signing key is bound. Cacheable for 5 minutes."
-      >
     | InternalServerError;
 }

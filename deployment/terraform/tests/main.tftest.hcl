@@ -111,31 +111,6 @@ run "secrets_store_binding" {
   }
 }
 
-run "no_signing_key_by_default" {
-  command = plan
-
-  assert {
-    condition     = length([for b in cloudflare_worker_version.this.bindings : b if b.name == "CLOUDFLARE_STS_API_SIGNING_KEY"]) == 0
-    error_message = "the signing key should only be bound when signing_key_secret is set"
-  }
-}
-
-run "signing_key_binding" {
-  command = plan
-
-  variables {
-    signing_key_secret = { secret_store_id = "00000000000000000000000000000000", secret_name = "cloudflare-sts-signing-key" }
-  }
-
-  assert {
-    condition = anytrue([
-      for b in cloudflare_worker_version.this.bindings :
-      b.name == "CLOUDFLARE_STS_API_SIGNING_KEY" && b.type == "secrets_store_secret" && b.secret_name == "cloudflare-sts-signing-key"
-    ])
-    error_message = "the signing key should be a Secrets Store binding"
-  }
-}
-
 run "policy_is_built_from_the_variables" {
   command = plan
 

@@ -7,14 +7,12 @@ export type SubjectTokenType = "urn:ietf:params:oauth:token-type:id_token" | "ur
 
 /**
  * What comes back: a Cloudflare API token, only R2 credentials for a profile without a
- * `token`, or, for another service's audience, a JWT access token (RFC 9068) the broker
- * signed: `access_token`, or `jwt` if that's what was requested.
+ * `token`, or only an Access service token for a profile with just an `access`.
  */
 export type IssuedTokenType =
   | "urn:ietf:params:oauth:token-type:access_token"
   | "urn:cloudflare-sts:params:oauth:token-type:r2_credentials"
-  | "urn:cloudflare-sts:params:oauth:token-type:access_service_token"
-  | "urn:ietf:params:oauth:token-type:jwt";
+  | "urn:cloudflare-sts:params:oauth:token-type:access_service_token";
 
 /**
  * Body of `POST /oauth/token`, an RFC 8693 token exchange, form-encoded. `scope` is
@@ -24,22 +22,15 @@ export interface TokenExchangeRequest {
   grant_type: "urn:ietf:params:oauth:grant-type:token-exchange";
   subject_token: string;
   subject_token_type: SubjectTokenType;
-  /**
-   * `https://api.cloudflare.com` (the default) for Cloudflare credentials, or the URL of a
-   * service the policy issues the broker's own tokens for.
-   */
-  audience?: string | undefined;
   requested_token_type?: IssuedTokenType | undefined;
   scope?: string | undefined;
   ttl?: string | undefined;
 }
 
 /**
- * `200` response of `POST /oauth/token`. A profile with only a `bucket` has no bearer token,
- * so it returns no `access_token` and `token_type: "N_A"`, with the credentials in `bucket`.
- * For another service's audience, `access_token` is a JWT access token (RFC 9068, `typ`
- * `at+jwt`) the broker signed, verifiable with the keys its metadata
- * (`/.well-known/oauth-authorization-server`, RFC 8414) names.
+ * `200` response of `POST /oauth/token`. A profile with only a `bucket` or an `access` has
+ * no bearer token, so it returns no `access_token` and `token_type: "N_A"`, with the
+ * credentials in `bucket` or `access`.
  */
 export interface TokenExchangeResponse {
   access_token?: string;
@@ -51,7 +42,7 @@ export interface TokenExchangeResponse {
   expires_at: number;
   /** The Cloudflare API token's ID, present with `access_token`. */
   token_id?: string;
-  /** The Cloudflare account, for the Cloudflare audience. */
+  /** The Cloudflare account. */
   account_id?: string;
   scope: string;
   bucket?: BucketCredentials;

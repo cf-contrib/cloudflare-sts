@@ -11,7 +11,7 @@ compatibility_date = "2026-08-15"
 [build]
 command = "worker-build --dev --features stand-ins"
 
-# The policy's issuer and providers' audience.
+# The policy's issuer, and the providers' audience.
 [dev]
 port = 8790
 
@@ -28,7 +28,7 @@ CLOUDFLARE_STS_API_CLOUDFLARE_URL = "http://127.0.0.1:8791/cloudflare/client/v4"
 # The policy: tests/config.toml and tests/policy.cedar, which tests/run.sh puts
 # in the local KV namespace as the keys `config` and `policy`. `mismatched`'s discovery document names another issuer, and so
 # does `pinned`'s, whose keys are at its jwks_uri. `typed` takes only access
-# tokens, which the stand-ins don't sign. `access` is where people sign in,
+# tokens (`at+jwt`). `access` is where people sign in,
 # shaped like an Access for SaaS OIDC app: its audience is its client ID.
 [[kv_namespaces]]
 binding = "CLOUDFLARE_STS_API_POLICY_KV"
@@ -39,8 +39,3 @@ id = "00000000000000000000000000000000"
 binding = "CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN"
 store_id = "00000000000000000000000000000000"
 secret_name = "cloudflare-token"
-
-[[secrets_store_secrets]]
-binding = "CLOUDFLARE_STS_API_SIGNING_KEY"
-store_id = "00000000000000000000000000000000"
-secret_name = "signing-key"

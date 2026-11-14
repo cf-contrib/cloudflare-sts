@@ -149,12 +149,6 @@ forward_claims = ["repository_owner_id", "environment"]
 access = { audience = "https://other-api.example.com" }
 
 [[profiles]]
-name = "nix-push"
-provider = "github"
-audience = "https://cloudflare-nix-api.example.com"
-forward_claims = ["repository_owner_id", "ref"]
-
-[[profiles]]
 name = "gitlab-deploy"
 provider = "gitlab"
 forward_claims = ["namespace_id", "project_path", "ref_protected"]
@@ -163,23 +157,16 @@ permissions = ["Workers Scripts Write"]
 resources = { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef" = "*" }
 
 [[profiles]]
-name = "gitlab-cache"
-provider = "gitlab"
-audience = "https://cloudflare-nix-api.example.com"
-forward_claims = ["project_path", "namespace_id"]
-
-[[profiles]]
 name = "gitlab-state"
 provider = "gitlab"
 forward_claims = ["namespace_id", "project_path"]
 bucket = { "name" = "org-terraform-state", "permission" = "object-read-write", "prefixes" = ["gitlab.com/{project_path}/", "{namespace_id}/{project_id}/"] }
 
 [[profiles]]
-name = "pinned-cache"
+name = "pinned-state"
 provider = "pinned"
-audience = "https://cloudflare-nix-api.example.com"
 forward_claims = ["namespace_id"]
-
+bucket = { "name" = "org-terraform-state", "permission" = "object-read-only", "prefixes" = ["pinned/{namespace_id}/"] }
 [[profiles]]
 name = "example-org/app:tofu-plan"
 provider = "access"

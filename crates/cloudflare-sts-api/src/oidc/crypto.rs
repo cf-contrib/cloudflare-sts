@@ -47,12 +47,6 @@ pub(crate) async fn verify_rs256(
     }
 }
 
-/// A fresh random UUID.
-pub(crate) fn random_uuid() -> Result<String, KeyError> {
-    let scope = js_sys::global().unchecked_into::<WorkerGlobalScope>();
-    Ok(scope.crypto().map_err(error)?.random_uuid())
-}
-
 /// What WebCrypto threw, as a [`KeyError`].
 pub(crate) fn error(err: JsValue) -> KeyError {
     let why = err

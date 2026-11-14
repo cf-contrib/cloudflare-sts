@@ -99,7 +99,7 @@ resource "cloudflare_worker_version" "this" {
     },
   ]
 
-  bindings = concat([
+  bindings = [
     {
       name = "CLOUDFLARE_STS_API_ACCOUNT_ID"
       type = "plain_text"
@@ -117,15 +117,7 @@ resource "cloudflare_worker_version" "this" {
       store_id    = var.cloudflare_token_secret.secret_store_id
       secret_name = var.cloudflare_token_secret.secret_name
     },
-    ], var.signing_key_secret == null ? [] : [
-    {
-      # The key the broker signs its own tokens with, for profiles with an audience.
-      name        = "CLOUDFLARE_STS_API_SIGNING_KEY"
-      type        = "secrets_store_secret"
-      store_id    = var.signing_key_secret.secret_store_id
-      secret_name = var.signing_key_secret.secret_name
-    },
-  ])
+  ]
 }
 
 # Promote the new version to 100% of traffic.

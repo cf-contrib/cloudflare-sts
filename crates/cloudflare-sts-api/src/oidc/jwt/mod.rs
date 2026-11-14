@@ -9,8 +9,8 @@ use serde_json::{Map, Value};
 
 pub(crate) use self::claims::LEEWAY_SECS;
 pub use self::{
-    claims::{AccessTokenClaims, Claims},
-    header::{ALGORITHM, AT_JWT, Header},
+    claims::Claims,
+    header::{ALGORITHM, Header},
 };
 use crate::oidc::{Error, error::invalid};
 

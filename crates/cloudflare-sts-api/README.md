@@ -65,7 +65,6 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
 | `CLOUDFLARE_STS_API_ACCOUNT_ID` | plain text | yes | Account the Cloudflare token belongs to and tokens are minted in. |
 | `CLOUDFLARE_STS_API_POLICY_KV` | Workers KV namespace | yes | Holds the [policy](#policy) under two keys: `config`, the TOML (or JSON), and `policy`, the Cedar. No size limit to speak of (a Worker variable held 5 KB). Each isolate keeps the policy it read for a minute. |
 | `CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN` | Secrets Store secret | yes | Account-owned token with Account API Tokens Write, plus R2 permissions covering what profiles' buckets delegate, plus Access: Service Tokens Write for profiles with an `access`. Read on every request, so rotating the secret takes effect without a redeploy. Anything else, such as a plain `wrangler secret`, is refused with `500`. |
-| `CLOUDFLARE_STS_API_SIGNING_KEY` | Secrets Store secret | for profiles with an `audience` | RSA private key (at least 2048 bits), as a PKCS#8 PEM, the broker signs [its own tokens](#tokens-for-other-services) with. Without it the broker issues none, publishes no keys, and those profiles fail closed with `500`. Bound as anything else, it's refused with `500`, as the Cloudflare token is. |
 
 The hourly cron (`17 * * * *` in the examples) deletes expired `cloudflare-sts:*` tokens.
 
@@ -98,7 +97,7 @@ that still has the old variable is refused (`500`, with where it went in the log
 a stale deployment is never mistaken for a working one.
 
 The bindings are read on every request. An unset account, an unreadable or invalid policy, or a
-Cloudflare token or signing key outside Secrets Store is a `500` on every route, the health
+Cloudflare token outside Secrets Store is a `500` on every route, the health
 endpoints' too, with the first problem in a `misconfigured` log line, such as
 `{"level":"ERROR","event":"misconfigured","message":"CLOUDFLARE_STS_API_POLICY_KV: provider com.github.actions has no policy admitting it: add a permit for Admit::Action::\\"com.github.actions\\" that pins your tenant"}`.
 
@@ -110,7 +109,7 @@ The policy is two files, kept in the `config` and `policy` keys of the [KV names
 
 ```toml
 version = 4
-issuer  = "https://cloudflare-sts-api.example.com"   # REQUIRED: the broker's URL, as its own tokens name it: an origin, no trailing /
+issuer  = "https://cloudflare-sts-api.example.com"   # REQUIRED: the broker's URL, an origin with no trailing /: its metadata's issuer
 
 [defaults]
 ttl     = "15m"   # default 15m
@@ -221,7 +220,7 @@ permit (principal, action == Profile::Action::"infra-admins:tofu-plan", resource
 when { ["alice@example.com", "bob@example.com"].contains(context.email) };
 ```
 
-A profile has a `token`, a `bucket`, an `access` (an [Access service token](#access-service-tokens)), or a mix, for callers with a token from its `provider`. A profile with an `audience` instead issues the broker's own token for that service: see [Tokens for other services](#tokens-for-other-services).
+A profile has a `token`, a `bucket`, an `access` (an [Access service token](#access-service-tokens)), or a mix, for callers with a token from its `provider`.
 
 To switch a profile off, for example during an incident, set `enabled = false`. It stays in the policy but never matches, and a request naming it is refused (`invalid_request`). Remember [how long a change takes](#bindings).
 
@@ -258,7 +257,7 @@ Cedar wants an action's type to end in `Action`, hence the namespaces. The reque
 |---|---|
 | `principal` | `Caller::"<sub>"`, the token's subject. |
 | `action` | `Admit::Action::"<provider>"` or `Profile::Action::"<profile>"`. |
-| `resource` | `Audience::"<audience>"`, what the profile issues for: `https://api.cloudflare.com` for Cloudflare credentials. |
+| `resource` | `Audience::"https://api.cloudflare.com"`, always: Cloudflare's credentials, what every profile issues. A policy can leave it unconstrained. |
 | `context` | The token's claims, each a string, or a set of strings if it's a list in the token (`groups`, `amr`). Numbers and booleans are strings as JSON writes them, so an ID is `"100000001"` whether the issuer quoted it or not: always compare with strings. Claims that are objects aren't in it. Reach a claim with a name Cedar can't write, such as a URL, with `context["https://example.com/claim"]`. |
 
 - **A claim the token doesn't have** errors where it's read, and an error makes that policy not match: a `permit` never allows because of it, but a `forbid` doesn't deny either. Guard with `context has claim && ...` where a claim is optional, and in any `forbid`.
@@ -266,7 +265,7 @@ Cedar wants an action's type to end in `Action`, hence the namespaces. The reque
 - **Every policy has an `@id`**, unique, and the audit log names the policies that decided a request (`policy`) instead of a position that changes when someone adds one above.
 - **A `permit` names its actions**, as `Admit::Action::"<provider>"` or `Profile::Action::"<name>"`, so none lets everything in. A `forbid` may leave them open, to hold for all.
 - **Names are checked against the configuration.** A policy naming a provider or profile that doesn't exist is an error, not a silent deny, and so is a provider or an enabled profile that nothing permits.
-- **Nothing here changes what a profile hands out.** Cedar decides who; the TOML decides what. A profile's `forward_claims` says which of the caller's claims a token for [another service](#tokens-for-other-services) carries, and which the audit log shows.
+- **Nothing here changes what a profile hands out.** Cedar decides who; the TOML decides what. A profile's `forward_claims` says which of the caller's claims the audit log shows.
 
 ### People
 
@@ -277,6 +276,21 @@ An ID token's `aud` is the client it was issued to, so that client's ID is the p
 Access's ID tokens carry `email`, `sub` and the application's `iss`, and last 5 minutes, whatever the application's access token lifetime ([#53](https://github.com/cf-contrib/cloudflare-sts/issues/53)). For a sign-in that lasts, give the application a refresh token lifetime (`saas-oidc`'s `refresh_token_lifetime`): cf-vault then renews the login without a browser. Access does not list `offline_access` in its metadata, so cf-vault has to ask for it: `scopes = ["openid", "email", "offline_access"]` in the profile.
 
 Keep people's profiles to what they need locally, such as read-only state, and keep `apply` in CI behind `environment: prod` with required reviewers.
+
+### Migration from 0.23
+
+The broker no longer issues tokens of its own, and no longer says how people sign in. Both are breaking:
+
+| Before | Now |
+|---|---|
+| a profile's `audience`: a token the broker signs for a service | gone, and an `audience` on a profile is refused when the policy loads (`unknown field`). To let CI call an application behind Cloudflare Access, give the profile an [`access`](#access-service-tokens) |
+| `CLOUDFLARE_STS_API_SIGNING_KEY`, and the Terraform `signing_key_secret` | gone: the broker holds no key. Delete the secret |
+| `GET /.well-known/jwks`, `/.well-known/openid-configuration` | gone (`404`). `/.well-known/oauth-authorization-server` stays, without `jwks_uri` |
+| the `audience` request parameter and the `jwt` requested token type | refused (`400`) |
+| a provider's `client_id`, and `identity_providers` in the metadata | gone. Set the provider's `audience` to the client ID. cf-vault is given the sign-in in its own profile: `oauth2.issuer`, `oauth2.client_id`, and the `exchange` endpoints |
+| `forward_claims` could not name `iss`, `sub`, `aud`, `exp`, `iat`, `nbf`, `jti`, `client_id`, `provider` or `profile` | it can: the claims are only logged now |
+
+Change cf-vault's profile first: the explicit form works against both versions. Then deploy.
 
 ### Migration from version 3
 
@@ -363,44 +377,6 @@ The job gets a client ID and secret, which it sends as the `CF-Access-Client-Id`
 - **Parent token:** the Cloudflare token needs **Access: Service Tokens Write**. That doesn't widen what a leaked Cloudflare token can do: with Account API Tokens Write it could already mint itself anything.
 - **What it doesn't do:** Access can't tell reads from writes, so a token admits its application whole. And a rule that admits *any* valid service token (rather than this tag) would admit every token in the account, whoever made it.
 
-### Tokens for other services
-
-A profile with `audience: <service URL>` gives the caller a token the broker signs itself, for another service that trusts the broker, such as [cloudflare-nix](https://github.com/cf-contrib/cloudflare-nix). It has no `token` or `bucket`: who may use the service is decided by the Cedar policy, like any other.
-
-```toml
-[[profiles]]
-name           = "example-org/app:ci.build"
-provider       = "com.github.actions"
-audience       = "https://cloudflare-nix-api.example.com"
-forward_claims = ["repository_id", "ref"]   # what the service may match on
-ttl            = "15m"
-```
-
-```cedar
-@id("ci-build")
-permit (principal, action == Profile::Action::"example-org/app:ci.build", resource)
-when { context.repository_id == "200000003" && context.ref == "refs/heads/main" };   // example-org/app
-```
-
-The caller asks for it with [`audience`](#token-exchange) set to the service's URL, and gets a JWT access token the broker signed, as RFC 9068 has it: `typ: at+jwt`, so a service can tell it from any other JWT, and `alg: RS256`, which verifiers support by default.
-
-- `iss` is the broker's URL (the policy's `issuer`), `aud` the service, `sub` the caller's `sub` from its issuer (`<provider>:unknown` if its token has none), and `client_id` the provider's name: the caller doesn't authenticate as a client, so the provider that vouched for it stands in.
-- `provider` and `profile` name where the caller came from and what allowed it, `jti` is unique, and `iat`, `nbf` and `exp` are when it was issued, valid from and until.
-- Verified claims are copied under their issuer's names, so a service can match on them: every claim the profile's `forward_claims` name. Nothing else, so an issuer's other claims (such as GitLab's `user_email`) stay behind.
-- It lasts the profile's `ttl`, but never past the caller's OIDC token, which lasts minutes. Exchange again for a fresh one: there are no refresh tokens. A subject token already past its `exp`, though accepted within the clock tolerance, gets nothing (`invalid_request`, `the subject token has expired`).
-
-Services find the public key at [`/.well-known/jwks`](#http-api), or through the broker's metadata: RFC 8414's at [`/.well-known/oauth-authorization-server`](#http-api), or OpenID Connect Discovery's at [`/.well-known/openid-configuration`](#http-api) for services that only read that, such as AWS IAM, Google Cloud Workload Identity Federation and Vault. They should check `typ` (`at+jwt`), `iss`, `aud`, `exp` and the `RS256` algorithm, as RFC 9068 §4 says. The broker isn't a full OpenID Provider: tokens come from exchange only, so, as for GitHub's and Kubernetes' issuers, its discovery document has no authorization endpoint. A service that verifies these tokens names the broker as a provider with `typ` `at+jwt`.
-
-The key is an RSA private key, at least 2048 bits, in Secrets Store, bound as `CLOUDFLARE_STS_API_SIGNING_KEY` (`signing_key_secret` in the [Terraform module](../../deployment/terraform)):
-
-```sh
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out signing-key.pem
-wrangler secrets-store secret create <store-id> --name cloudflare-sts-signing-key --scopes workers   # paste the PEM
-rm signing-key.pem
-```
-
-Its `kid` is the public key's thumbprint, so replacing the secret rotates the key. Tokens signed with the old key stop verifying once services refetch the JWKS, and they're short-lived anyway.
-
 ### TTL and names
 
 - Durations look like `90s`, `15m`, `1h`, `1h30m`: each unit once, largest first.
@@ -448,7 +424,6 @@ These are enforced when the policy loads, so an unsafe policy never serves a req
 2. **Every policy is named and scoped.** Each has a unique `@id`, and a `permit` names its provider or profile, so none lets everything in. A policy naming a provider or profile that doesn't exist is refused, and so is an enabled profile that nothing permits.
 3. **No token-management permissions.** Granting (`effect: allow`) any permission group whose name contains `API Tokens`, in any case, is rejected, so a job can't turn its short-lived token into a long-lived one. A `deny` may name one.
 4. **TTLs are capped.** `max_ttl` is at most 24h, and `ttl` can't exceed it.
-5. **Audiences are kept apart.** A request only matches profiles for its `audience`. A profile for another service can't hand out Cloudflare credentials, and its audience must be a bare origin other than the broker's own.
 
 ## HTTP API
 
@@ -456,11 +431,9 @@ These are enforced when the policy loads, so an unsafe policy never serves a req
 |---|---|---|---|
 | `POST` | `/oauth/token` | `subject_token` in the body | [Token exchange](#token-exchange) (RFC 8693) of an OIDC token. What the action uses. |
 | `POST` | `/oauth/revoke` | `token` in the body | [Revoke](#revocation) (RFC 7009) a token the broker minted. What the action's post step uses. |
-| `GET` | `/.well-known/oauth-authorization-server` | public | The broker's Authorization Server Metadata (RFC 8414): its issuer, key and endpoint URLs, for services that verify [its tokens](#tokens-for-other-services). Its endpoints' auth methods are `none`: callers don't authenticate as clients. |
-| `GET` | `/.well-known/openid-configuration` | public | The same issuer and keys as OpenID Provider Metadata (OpenID Connect Discovery 1.0), for services that only read that. |
-| `GET` | `/.well-known/jwks` | public | The public key the broker signs its own tokens with. Empty without `CLOUDFLARE_STS_API_SIGNING_KEY`. |
+| `GET` | `/.well-known/oauth-authorization-server` | public | The broker's Authorization Server Metadata (RFC 8414): its issuer and endpoint URLs, for clients such as cf-vault. Its endpoints' auth methods are `none`: callers don't authenticate as clients. |
 | `GET` | `/health/live` | public | `200` whenever the Worker's bindings are valid. |
-| `GET` | `/health/ready` | public | `200` when the Worker's bindings are valid and its secrets can be read: the Cloudflare token, and the signing key if one is bound. `503` otherwise, with why in Workers Logs (`unready`). It doesn't call Cloudflare's API, so it can't tell a revoked token from a good one. |
+| `GET` | `/health/ready` | public | `200` when the Worker's bindings are valid and its secrets can be read: the Cloudflare token. `503` otherwise, with why in Workers Logs (`unready`). It doesn't call Cloudflare's API, so it can't tell a revoked token from a good one. |
 
 Bodies are form-encoded and at most 16 KiB; anything else, such as a JSON body, is `400` (`invalid_request`). Every response is `Cache-Control: no-store`, except the discovery endpoints' `200`s, which are `public, max-age=300`.
 
@@ -481,12 +454,11 @@ curl -sS https://cloudflare-sts-api.example.com/oauth/token \
 | `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` |
 | `subject_token` | An OIDC token from a provider's issuer |
 | `subject_token_type` | `urn:ietf:params:oauth:token-type:id_token` or `urn:ietf:params:oauth:token-type:jwt` |
-| `audience` | Optional. `https://api.cloudflare.com`, the default, for Cloudflare credentials; or a service's URL for [the broker's own token](#tokens-for-other-services) |
-| `requested_token_type` | Optional. For Cloudflare, `urn:ietf:params:oauth:token-type:access_token` or `urn:cloudflare-sts:params:oauth:token-type:r2_credentials`; for a service, `urn:ietf:params:oauth:token-type:jwt` or `…:access_token` |
+| `requested_token_type` | Optional. `urn:ietf:params:oauth:token-type:access_token`, `urn:cloudflare-sts:params:oauth:token-type:r2_credentials` or `urn:cloudflare-sts:params:oauth:token-type:access_service_token` |
 | `scope` | Optional. The profiles to get, space-delimited ([RFC 6749 §3.3](https://www.rfc-editor.org/rfc/rfc6749#section-3.3)); the caller must be allowed every one, see [Several scopes](#several-scopes). If omitted, exactly one profile must match |
 | `ttl` | Optional. Requested lifetime such as `10m` or `1h`, clamped to the profile's `max_ttl` |
 
-Delegation (`actor_token`), audiences no profile is for, and other token types are refused with `400`, not ignored.
+Delegation (`actor_token`), an `audience` (the broker issues Cloudflare's credentials only), and other token types are refused with `400`, not ignored.
 
 The response has the standard fields plus the broker's own:
 
@@ -507,24 +479,22 @@ The response has the standard fields plus the broker's own:
 
 `scope` says which profiles were granted, space-delimited, in the order asked for.
 
-`requested_token_type` doesn't choose what's issued: the profile does. It only refuses a type the audience can't have (`invalid_target`), so a profile with a `token` and a `bucket` answers `access_token` even if `r2_credentials` was asked for.
+`requested_token_type` doesn't choose what's issued: the profile does. It only refuses a type the broker doesn't issue (`400`), so a profile with a `token` and a `bucket` answers `access_token` even if `r2_credentials` was asked for.
 
-`bucket` is there when the profile has one, and `access` when it has an `access`. A profile with only an access has no bearer token either, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:access_service_token` and `token_type` `N_A`. A profile with only a bucket has no bearer token, so it returns no `access_token` or `token_id`, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:r2_credentials` and `token_type` `N_A`. For a service's audience, `access_token` is the broker's JWT access token, `issued_token_type` is `urn:ietf:params:oauth:token-type:access_token` (or `…:jwt`, if that's what `requested_token_type` asked for), and there's no `token_id`, `account_id` or `bucket`.
+`bucket` is there when the profile has one, and `access` when it has an `access`. A profile with only an access has no bearer token either, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:access_service_token` and `token_type` `N_A`. A profile with only a bucket has no bearer token, so it returns no `access_token` or `token_id`, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:r2_credentials` and `token_type` `N_A`.
 
 Errors are the same as on every route.
 
 ### Several scopes
 
-`scope` can name several profiles, as a space-delimited list. The caller must be allowed every one: if any is unknown, disabled, for another provider or audience, or not allowed by the policy, the request is `invalid_scope` and nothing is issued. Asking twice for the same profile is asking once.
+`scope` can name several profiles, as a space-delimited list. The caller must be allowed every one: if any is unknown, disabled, for another provider, or not allowed by the policy, the request is `invalid_scope` and nothing is issued. Asking twice for the same profile is asking once.
 
-Profiles for Cloudflare's audience are combined into one grant:
+They're combined into one grant:
 
 - **Token:** their `token.policies` together, as one token, so it can do what each of them could.
 - **Bucket:** at most one of them may have a `bucket`, because the credentials are for one bucket. Two is `invalid_scope`.
 - **Access:** at most one of them may have an `access`, because a service token is for one application. Two is `invalid_scope`.
 - **Lifetime:** the shortest `ttl` and the shortest `max_ttl` among them, so nothing outlives what any of them allows.
-
-A profile for another service's audience gives the broker's own token with that profile's claims, so a request for it takes exactly one scope.
 
 ```sh
 curl -sS https://cloudflare-sts-api.example.com/oauth/token \
@@ -545,7 +515,6 @@ curl -sS https://cloudflare-sts-api.example.com/oauth/revoke -d token="$CLOUDFLA
 **Errors:** OAuth errors (RFC 6749 §5.2), `{ "error": "<code>", "error_description": "<what went wrong>" }`, as RFC 8693 and RFC 7009 have them:
 
 - `400 invalid_request`: a malformed request, a subject token that's invalid, or one the policy doesn't take (RFC 8693 §2.2.2)
-- `400 invalid_target`: an `audience` the broker issues nothing for, or can't issue the requested token type for (RFC 8693)
 - `400 unsupported_grant_type`: a `grant_type` other than token exchange
 - `500 server_error`: the broker is misconfigured or failed
 - `503 temporarily_unavailable`: Cloudflare or the subject token's issuer failed
@@ -568,8 +537,6 @@ For the caller's own mistakes (400) the description says what was wrong, for exa
 | Stolen R2 credentials | Limited to one bucket and the repo's prefixes, and short-lived. They can't be revoked one by one; rolling the Cloudflare token revokes all of them |
 | One repo reaches another's R2 keys | Prefixes must end in `/`, placeholders fill whole segments from verified claims with a fixed character set, and both the template and the result are checked. Prefer ID-based prefixes |
 | Stolen JWT replayed | Short JWT lifetime and a custom audience |
-| Stolen broker-issued token | Valid for one service (`aud`), and never longer than the job's OIDC token it came from |
-| Signing key exfiltrated | Kept in Secrets Store like the Cloudflare token. Replace the secret to rotate it: the new key gets a new `kid`, and services stop accepting the old one once they refetch the JWKS |
 | One caller reaches another's R2 keys through a prefix claim | A value spans path segments only as a template's one placeholder, and every filled-in prefix is checked again |
 | Cloudflare token exfiltrated | Kept in Secrets Store, so it isn't in Terraform state or CI. Only code running in the Worker can read it. Restrict who can deploy Workers in the broker's account, rotate the Cloudflare token, and consider a dedicated account per trust domain. |
 | Token flooding | Only callers the policy allows can mint. Tokens are short-lived, revoked at job end, and cleaned up hourly. There's no rate limit yet (see [Limitations](#limitations)). |
@@ -596,19 +563,13 @@ An Access service token is `access.issued`, with the application and the token's
 {"level":"INFO","event":"access.issued","provider":"com.github.actions","profile":"example-org/app:ci.nix","sub":"repo:example-org/app:ref:refs/heads/main","claims":"{\"ref\":\"refs/heads/main\"}","audience":"https://nix.example.com","token_id":"<uuid>","expires_at":1790961140}
 ```
 
-A token for another service is `token.issue`, with the audience and the token's `jti`, never the token:
-
-```json
-{"level":"INFO","event":"token.issue","provider":"com.github.actions","profile":"example-org/app:ci.build","sub":"repo:example-org/app:ref:refs/heads/main","claims":"{\"ref\":\"refs/heads/main\",\"repository_owner_id\":\"100000001\"}","audience":"https://cloudflare-nix-api.example.com","jti":"<uuid>","expires_at":1790960440}
-```
-
 Denials are `token.deny`, a warning, with the response's `error`, and its `error_description` as `message`. For the broker's own faults, the message is the full one the caller doesn't get:
 
 ```json
 {"level":"WARN","event":"token.deny","provider":"com.github.actions","profile":"example-org:workers-deploy","sub":"repo:example-org/app:environment:prod","claims":"{\"repository\":\"example-org/app\",\"repository_owner_id\":\"100000001\"}","error":"temporarily_unavailable","message":"Cloudflare: tokens.create: returned 500"}
 ```
 
-- **Request problems** (`invalid_request`, `invalid_scope`, `invalid_target`, `unsupported_grant_type`): what the contract refuses, such as another `grant_type`, `actor_token`, a missing field or a JSON body; an invalid subject token, or one from an issuer no provider is for; a `ttl` or `audience` that doesn't fit.
+- **Request problems** (`invalid_request`, `invalid_scope`, `unsupported_grant_type`): what the contract refuses, such as another `grant_type`, `actor_token`, a missing field or a JSON body; an invalid subject token, or one from an issuer no provider is for; a `ttl` that doesn't fit, or an `audience`.
 - **The policy didn't allow it** (`invalid_request`, or `invalid_scope` for a scope): the policy doesn't admit the token to its provider, no profile matches, several do and none is named, a claim can't fill a bucket prefix. A `scope` the caller can't have, or that names an unknown or disabled profile or one for another provider or audience, is `invalid_scope`.
 - **Configuration or upstream faults** (`server_error`, `temporarily_unavailable`): a secret that can't be read, an unknown permission name, an issuer's keys, Cloudflare failing.
 
@@ -629,7 +590,6 @@ The other events:
 - **RS256 only, one provider per issuer.** Issuers that sign with another algorithm (such as ES256) aren't supported yet. To serve several GitHub orgs, admit them all in the provider's `permit`: `["100000001", "100000002"].contains(context.repository_owner_id)`.
 - **OIDC tokens only.** People need an identity provider that issues them one, such as [Cloudflare Access](#people). Rules on a person's role in a GitHub repo can't be expressed: their tokens don't carry it.
 - **The tenant pin is yours to get right.** The broker requires every provider to have an `Admit` permit, but knows no issuer's tenant claim by name.
-- **One signing key at a time.** Rotating it can't publish the old and new keys side by side, so a token signed just before the rotation fails at a service that has already refetched the JWKS. They're short-lived, and the caller can exchange again.
 - **No JWT replay cache.** A stolen JWT can be exchanged again until it expires. The custom audience and its short lifetime limit this.
 - **Resource IDs aren't checked up front.** Apart from the account check, a wrong zone ID is only caught when Cloudflare rejects the mint (`503`).
 - **Permission names can change.** Cloudflare can rename a permission group. Profiles using the old name fail closed (`500`) until the policy is updated.
@@ -647,7 +607,7 @@ The crate is laid out as cloudflare-nix's Worker is:
 | `src/lib.rs` | The start, fetch and scheduled events: the JSON logger, the configuration, then the SDK's two routers over it, the token endpoints under the auth layer and the discovery endpoints under `cache_publicly`, and the health endpoints, all under `OAuthResponseLayer`. |
 | `src/service/config.rs` | The bindings and the policy from KV, read in `Config::load` only, and the configuration's format: providers, profiles, bucket prefixes, and the guardrails parsing checks. |
 | `src/service/authz.rs` | The Cedar half of the policy: parsing it, checking it against the configuration, and asking it who may be admitted and who gets which profile. |
-| `src/oidc/` | OIDC tokens in the Worker, verified and signed: the JWT format (RFC 7515, 7519, 9068), providers found by `iss` with their keys from the issuer's metadata (RFC 7517, 8414, OpenID Connect Discovery), and RS256 through the runtime's WebCrypto, for verifying and for signing the broker's own tokens. |
+| `src/oidc/` | OIDC tokens in the Worker, verified: the JWT format (RFC 7515, 7519), providers found by `iss` with their keys from the issuer's metadata (RFC 7517, 8414, OpenID Connect Discovery), and RS256 through the runtime's WebCrypto. |
 | `src/service/layer.rs` | Exchange auth, as a tower layer over `oidc`: the subject token's provider by `iss`, RS256 against the issuer's keys with WebCrypto, the standard claims, and whether the policy admits it. And `OAuthResponseLayer`, OAuth's rules for every response: the generated validation's refusals as `invalid_request`, and `Cache-Control: no-store`; `cache_publicly`, the discovery endpoints' `public, max-age=300`. |
 | `src/service/handler.rs` | The generated API's implementation, a handler per trait. `TokenServiceHandler`: the exchange (profiles, Cloudflare tokens and R2 credentials through [cloudflare-rs](https://github.com/cf-contrib/cloudflare-rs), the broker's own tokens), revocation, and the cleanup the cron runs. `DiscoveryServiceHandler`: the RFC 8414 and OpenID Connect Discovery metadata, and the keys. |
 

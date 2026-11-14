@@ -55,7 +55,7 @@ by default deploys the broker of the release its `ref` points to.
   (see [Access service tokens](../../crates/cloudflare-sts-api#access-service-tokens)).
 - A separate API token for *deploying*, exported as `CLOUDFLARE_API_TOKEN`, with:
   - **Account → Workers Scripts: Edit**
-  - **Account → Secrets Store: Edit**, to bind the Cloudflare token's secret, and the signing key's if set
+  - **Account → Secrets Store: Edit**, to bind the Cloudflare token's secret
   - **Zone → Workers Routes: Edit** on the broker's zone, only for a custom domain (not tested yet)
 
   The first two were enough for a workers.dev deploy in testing.
@@ -348,7 +348,6 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
 | `hostname` | yes | | `<worker_name>.<subdomain>.workers.dev`, or a custom domain. |
 | `zone_id` | for a custom domain | `null` | Zone ID of the zone holding a custom-domain `hostname`. |
 | `cloudflare_token_secret` | yes | | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the Cloudflare token. With a profile's `bucket`, the token also needs R2 permissions covering what it delegates. |
-| `signing_key_secret` | for profiles with an `audience` | `null` | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the RSA key the broker signs its own tokens with. See [Tokens for other services](../../crates/cloudflare-sts-api#tokens-for-other-services). |
 | `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ? }` each. `audience` defaults to the broker's URL; for [people](../../crates/cloudflare-sts-api#people) it is the client they sign in as. See [Policy](#policy). |
 | `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `access`, `audience`. See [Policy](#policy). |
 | `cedar_policy` | yes | | Who gets what: Cedar text with a permit for `Admit::Action::"<provider>"` for every provider, pinning your org, and `Profile::Action::"<name>"` for every profile, each with an `@id`. See [Policy](#policy). |
@@ -375,7 +374,7 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
 - Worker bindings are reset on every version upload, so every binding the broker
   needs is declared here.
 - `tofu test` plans the module with mocked providers (no credentials needed) and
-  checks the bindings (the Cloudflare token's, and the signing key's when set),
+  checks the bindings (the Cloudflare token's),
   both URL modes and the `hostname` and `zone_id` checks, local artifacts,
   checksums, and the policy built from its variables: what it fills in, what it
   leaves out, and its size.
