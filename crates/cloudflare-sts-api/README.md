@@ -251,7 +251,7 @@ A profile's `provider` can be left out when the policy has exactly one provider.
 A caller's token is checked in two steps, each a request to Cedar, which denies unless a `permit` matches and no `forbid` does:
 
 1. **Admit**, once the token is verified: action `Admit::Action::"<provider>"`. This is where the tenant is pinned. A token that fails is `invalid_request`, "the policy doesn't admit the token".
-2. **Profile**, for the profile it gets: action `Profile::Action::"<name>"`. If the request names a `profile`, that one must be allowed. Otherwise exactly one profile of the provider and audience must be. Both failures are `invalid_request`, and the description says which.
+2. **Profile**, for the profiles it gets: action `Profile::Action::"<name>"`. If the request names `scope`s, every one must be allowed, or the request is `invalid_scope` and nothing is issued. Otherwise exactly one profile of the provider and audience must be, or the request is `invalid_request`. The description says which.
 
 Cedar wants an action's type to end in `Action`, hence the namespaces. The request is:
 
@@ -328,7 +328,7 @@ A profile's `bucket` gets the job [temporary R2 credentials](https://developers.
       prefixes: ["github.com/{repository}/"]
 ```
 
-- **One bucket per profile,** so the action always exports its credentials under the same names, `CLOUDFLARE_R2_*`. A job that needs two buckets uses two profiles, in two jobs.
+- **One bucket per profile,** so the action always exports its credentials under the same names, `CLOUDFLARE_R2_*`. A request for several scopes may name at most one profile with a bucket; a job that needs two buckets uses two profiles, in two jobs.
 
 - **Placeholders** are `{claim}`, not `${claim}`, so HCL leaves them alone. Any claim can fill one: `{repository}` from GitHub Actions, `{project_path}` from GitLab, `{email}`… They're filled in from the verified token, never from the request.
 - **Prefixes** must end in `/`, so `github.com/org/site/` doesn't also cover `github.com/org/site-old/`. They can't start with `/` or contain `*`, `..`, empty or `.` segments, or control characters, and each placeholder must be a whole path segment (`tfstate/{repository_id}/`, not `tfstate-{repository_id}/`), so two repos can never end up with the same prefix. These are checked when the policy loads.
@@ -412,7 +412,7 @@ These are recommendations: the broker enforces only the characters and the lengt
 | `tofu plan` for people, through Access | `infra-admins:tofu-plan` |
 
 - **Name the job, not the tool:** `ci.apply`, not `ci.tofu-apply`. When the job is renamed, rename the profile with it.
-- **One job, one profile.** A job that needs two buckets uses two profiles, in two jobs.
+- **One job, one profile, unless it needs several.** A job that needs a token and a bucket can ask for both profiles as one `scope`. A job that needs two buckets uses two profiles, in two jobs.
 - **The name enforces nothing; the claims do.** Derive the name from the claims, so the two can't drift. In Terraform, build `name`, `repository_id` and `workflow_ref` from the same locals.
 
 **Providers: the issuing service, reverse-DNS.** `com.github.actions`, `com.gitlab`, `com.cloudflare.access`. That reads like the policy's resource keys (`com.cloudflare.api.account.<id>`) and, in the broker's own tokens, like the client identifier it is in `client_id`. A longer name takes more of a minted token's 120 characters, `cloudflare-sts:<provider>:<sub>`, which is cut to fit.
@@ -452,7 +452,7 @@ curl -sS https://cloudflare-sts-api.example.com/oauth/token \
   -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   -d subject_token="$GITHUB_OIDC_TOKEN" \
   -d subject_token_type=urn:ietf:params:oauth:token-type:id_token \
-  -d profile=example-org:workers-deploy
+  -d scope=example-org:workers-deploy
 ```
 
 | Parameter | |
@@ -462,7 +462,7 @@ curl -sS https://cloudflare-sts-api.example.com/oauth/token \
 | `subject_token_type` | `urn:ietf:params:oauth:token-type:id_token` or `urn:ietf:params:oauth:token-type:jwt` |
 | `audience` | Optional. `https://api.cloudflare.com`, the default, for Cloudflare credentials; or a service's URL for [the broker's own token](#tokens-for-other-services) |
 | `requested_token_type` | Optional. For Cloudflare, `urn:ietf:params:oauth:token-type:access_token` or `urn:cloudflare-sts:params:oauth:token-type:r2_credentials`; for a service, `urn:ietf:params:oauth:token-type:jwt` or `…:access_token` |
-| `profile` | Optional. Profile to use; if omitted, exactly one profile must match |
+| `scope` | Optional. The profiles to get, space-delimited ([RFC 6749 §3.3](https://www.rfc-editor.org/rfc/rfc6749#section-3.3)); the caller must be allowed every one, see [Several scopes](#several-scopes). If omitted, exactly one profile must match |
 | `ttl` | Optional. Requested lifetime such as `10m` or `1h`, clamped to the profile's `max_ttl` |
 
 Delegation (`actor_token`), audiences no profile is for, and other token types are refused with `400`, not ignored.
@@ -478,16 +478,38 @@ The response has the standard fields plus the broker's own:
   "expires_at": 1790597700,
   "token_id": "…",
   "account_id": "0123456789abcdef0123456789abcdef",
-  "profile": "example-org:workers-deploy",
+  "scope": "example-org:workers-deploy",
   "bucket": { "name": "…", "access_key_id": "…", "secret_access_key": "…", "session_token": "…", "prefixes": ["…"], "endpoint": "…", "expires_on": "…" }
 }
 ```
+
+`scope` says which profiles were granted, space-delimited, in the order asked for.
 
 `requested_token_type` doesn't choose what's issued: the profile does. It only refuses a type the audience can't have (`invalid_target`), so a profile with a `token` and a `bucket` answers `access_token` even if `r2_credentials` was asked for.
 
 `bucket` is there when the profile has one. A profile with only a bucket has no bearer token, so it returns no `access_token` or `token_id`, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:r2_credentials` and `token_type` `N_A`. For a service's audience, `access_token` is the broker's JWT access token, `issued_token_type` is `urn:ietf:params:oauth:token-type:access_token` (or `…:jwt`, if that's what `requested_token_type` asked for), and there's no `token_id`, `account_id` or `bucket`.
 
 Errors are the same as on every route.
+
+### Several scopes
+
+`scope` can name several profiles, as a space-delimited list. The caller must be allowed every one: if any is unknown, disabled, for another provider or audience, or not allowed by the policy, the request is `invalid_scope` and nothing is issued. Asking twice for the same profile is asking once.
+
+Profiles for Cloudflare's audience are combined into one grant:
+
+- **Token:** their `token.policies` together, as one token, so it can do what each of them could.
+- **Bucket:** at most one of them may have a `bucket`, because the credentials are for one bucket. Two is `invalid_scope`.
+- **Lifetime:** the shortest `ttl` and the shortest `max_ttl` among them, so nothing outlives what any of them allows.
+
+A profile for another service's audience gives the broker's own token with that profile's claims, so a request for it takes exactly one scope.
+
+```sh
+curl -sS https://cloudflare-sts-api.example.com/oauth/token \
+  -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  -d subject_token="$GITHUB_OIDC_TOKEN" \
+  -d subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+  --data-urlencode "scope=example-org:workers-deploy example-org:terraform-state"
+```
 
 ### Revocation
 
@@ -556,8 +578,8 @@ Denials are `token.deny`, a warning, with the response's `error`, and its `error
 {"level":"WARN","event":"token.deny","provider":"com.github.actions","profile":"example-org:workers-deploy","sub":"repo:example-org/app:environment:prod","claims":"{\"repository\":\"example-org/app\",\"repository_owner_id\":\"100000001\"}","error":"temporarily_unavailable","message":"Cloudflare: tokens.create: returned 500"}
 ```
 
-- **Request problems** (`invalid_request`, `invalid_target`, `unsupported_grant_type`): what the contract refuses, such as another `grant_type`, `actor_token`, a missing field or a JSON body; an invalid subject token, or one from an issuer no provider is for; a `ttl` or `audience` that doesn't fit.
-- **The policy didn't allow it** (`invalid_request` too): the policy doesn't admit the token to its provider, no profile matches, several do, the named one doesn't, a claim can't fill a bucket prefix.
+- **Request problems** (`invalid_request`, `invalid_scope`, `invalid_target`, `unsupported_grant_type`): what the contract refuses, such as another `grant_type`, `actor_token`, a missing field or a JSON body; an invalid subject token, or one from an issuer no provider is for; a `ttl` or `audience` that doesn't fit.
+- **The policy didn't allow it** (`invalid_request`, or `invalid_scope` for a scope): the policy doesn't admit the token to its provider, no profile matches, several do and none is named, a claim can't fill a bucket prefix. A `scope` the caller can't have, or that names an unknown or disabled profile or one for another provider or audience, is `invalid_scope`.
 - **Configuration or upstream faults** (`server_error`, `temporarily_unavailable`): a secret that can't be read, an unknown permission name, an issuer's keys, Cloudflare failing.
 
 The other events:

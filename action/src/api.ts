@@ -16,8 +16,8 @@ export type IssuedTokenType =
   | "urn:ietf:params:oauth:token-type:jwt";
 
 /**
- * Body of `POST /oauth/token`, an RFC 8693 token exchange, form-encoded. `profile` and
- * `ttl` are the broker's own extension parameters.
+ * Body of `POST /oauth/token`, an RFC 8693 token exchange, form-encoded. `scope` is
+ * the profiles to get, space-delimited, and `ttl` is the broker's own extension parameter.
  */
 export interface TokenExchangeRequest {
   grant_type: "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -29,7 +29,7 @@ export interface TokenExchangeRequest {
    */
   audience?: string | undefined;
   requested_token_type?: IssuedTokenType | undefined;
-  profile?: string | undefined;
+  scope?: string | undefined;
   ttl?: string | undefined;
 }
 
@@ -52,7 +52,7 @@ export interface TokenExchangeResponse {
   token_id?: string;
   /** The Cloudflare account, for the Cloudflare audience. */
   account_id?: string;
-  profile: string;
+  scope: string;
   bucket?: BucketCredentials;
 }
 

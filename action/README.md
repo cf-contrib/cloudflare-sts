@@ -23,7 +23,7 @@ jobs:
       - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
         with:
           url: https://cloudflare-sts-api.example.com
-          profile: example-org/app:ci.deploy
+          scopes: example-org/app:ci.deploy
       - run: npx wrangler deploy
 ```
 
@@ -47,11 +47,11 @@ A floating `v1` tag will follow each release from 1.0 on.
 
 ## Inputs
 
-| Input     | Required | Description                                                                                                                                                    |
-| --------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `url`     | yes      | Broker base URL, e.g. `https://cloudflare-sts-api.example.com`. Its origin is the OIDC audience and must equal the GitHub provider's `audience` in the policy. |
-| `profile` | no       | Policy profile to request (not an AWS profile). Recommended when more than one profile could match.                                                            |
-| `ttl`     | no       | Requested lifetime such as `5m` or `1h`. Defaults to the profile's `ttl`, capped at its `max_ttl`.                                                             |
+| Input    | Required | Description                                                                                                                                                            |
+| -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `url`    | yes      | Broker base URL, e.g. `https://cloudflare-sts-api.example.com`. Its origin is the OIDC audience and must equal the GitHub provider's `audience` in the policy.         |
+| `scopes` | no       | Policy profiles to request, separated by spaces or newlines (not AWS profiles). Every one must allow the workflow. Recommended when more than one profile could match. |
+| `ttl`    | no       | Requested lifetime such as `5m` or `1h`. Defaults to the profile's `ttl`, capped at its `max_ttl`.                                                                     |
 
 ## What it does
 
@@ -64,8 +64,8 @@ A floating `v1` tag will follow each release from 1.0 on.
   - logs the token ID, profile and expiry (none of them secret), so a run can be matched to the broker's audit log:
 
     ```
-    cloudflare-sts: minted token 3f2a… (profile example-org/app:ci.deploy, expires 2026-09-28T12:15:00Z)
-    cloudflare-sts: issued R2 credentials for bucket org-terraform-state under 100000001/200000003/ (profile example-org:terraform-state, expires 2026-09-28T12:15:00Z)
+    cloudflare-sts: minted token 3f2a… (scope example-org/app:ci.deploy, expires 2026-09-28T12:15:00Z)
+    cloudflare-sts: issued R2 credentials for bucket org-terraform-state under 100000001/200000003/ (scope example-org:terraform-state, expires 2026-09-28T12:15:00Z)
     ```
 
 - **Post step:** revokes the token, if there is one. It runs even when the job fails. A failed revoke is a warning, not an error: the token expires on its own and the broker's cron deletes it. R2 credentials can't be revoked; the post step logs when they expire:
@@ -87,7 +87,7 @@ None of this can be switched off: what's exported is decided by the profile. Exp
 - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
-    profile: example-org/app:ci.deploy
+    scopes: example-org/app:ci.deploy
 - uses: cloudflare/wrangler-action@v3
   with:
     apiToken: ${{ env.CLOUDFLARE_API_TOKEN }}
@@ -100,7 +100,7 @@ None of this can be switched off: what's exported is decided by the profile. Exp
 - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
-    profile: example-org/infra:ci.apply
+    scopes: example-org/infra:ci.apply
     ttl: 30m
 - run: tofu apply -auto-approve # the cloudflare provider reads CLOUDFLARE_API_TOKEN
 ```
@@ -125,7 +125,7 @@ S3 tools read `AWS_*`, so map the credentials in the step that runs them:
 - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
-    profile: example-org:terraform-state
+    scopes: example-org:terraform-state
 - run: aws s3 cp plan.out "s3://$CLOUDFLARE_R2_BUCKET/${CLOUDFLARE_R2_PREFIX}plan.out"
   env:
     AWS_ACCESS_KEY_ID: ${{ env.CLOUDFLARE_R2_ACCESS_KEY_ID }}
@@ -138,6 +138,19 @@ S3 tools read `AWS_*`, so map the credentials in the step that runs them:
 - **One bucket per profile.** A job that needs two buckets uses two profiles in two jobs, as in [Two scopes: two jobs](#two-scopes-two-jobs): a second run of the action in the same job replaces the first one's `CLOUDFLARE_R2_*`.
 - **No revocation.** The credentials last as long as the profile's `ttl` (or the requested `ttl`, capped at `max_ttl`), so keep it short.
 
+### Several scopes in one job
+
+List the profiles in `scopes`, one per line or separated by spaces. The workflow must be allowed every one, and the token gets what they grant together. At most one of them may have a bucket.
+
+```yaml
+- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+  with:
+    url: https://cloudflare-sts-api.example.com
+    scopes: |
+      example-org/app:ci.dns
+      example-org/app:ci.deploy
+```
+
 ### Two scopes: two jobs
 
 ```yaml
@@ -149,7 +162,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
-        with: { url: https://cloudflare-sts-api.example.com, profile: example-org/app:ci.dns }
+        with: { url: https://cloudflare-sts-api.example.com, scopes: example-org/app:ci.dns }
       - run: ./scripts/update-dns.sh
 
   deploy:
@@ -160,28 +173,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
-        with: { url: https://cloudflare-sts-api.example.com, profile: example-org/app:ci.deploy }
+        with: { url: https://cloudflare-sts-api.example.com, scopes: example-org/app:ci.deploy }
       - run: npx wrangler deploy
 ```
 
 ## Troubleshooting
 
-| Error                                                                        | Cause                                                                                                                                                                                                                         |
-| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OIDC unavailable: add permissions: id-token: write to the job`              | The job can't request an OIDC token. Add the permission. Fork PRs on `pull_request` never get it.                                                                                                                             |
-| `OIDC token request failed: <status>`                                        | The runner's token endpoint refused the request, or still failed after 3 tries.                                                                                                                                               |
-| `cloudflare-sts broker returned 400 (invalid_request: …)`                    | The broker rejected the OIDC token, usually because `url` doesn't match the GitHub provider's `audience` in the policy; or no profile allows this workflow, or the named `profile` doesn't match. The description says which. |
-| `cloudflare-sts broker returned 503 (temporarily_unavailable: …)`            | The Cloudflare API or the subject token's issuer failed; the broker's log (`token.deny`) says which. For a profile with a `bucket`, it's usually a Cloudflare token without enough R2 permissions on it.                      |
-| `cloudflare-sts broker returned 500 (server_error: …)`                       | The broker's policy or bindings are invalid. The broker's logs say why.                                                                                                                                                       |
-| `cloudflare-sts broker returned 404: the broker doesn't serve /oauth/token…` | `url` isn't the broker, or the broker is from an older release than the action. Deploy the broker from the action's release.                                                                                                  |
-| `cloudflare-sts broker returned an invalid response: missing …`              | The broker answered `200` without what the action needs: a broker from another release, or something else at `url`.                                                                                                           |
-| `url must use https`                                                         | Plain `http` is only accepted for `localhost`, `127.0.0.1` and `[::1]`.                                                                                                                                                       |
-| `AccessDenied` from S3 on some keys                                          | The credentials only cover the bucket's prefixes: keep every key under `$CLOUDFLARE_R2_PREFIX`.                                                                                                                               |
+| Error                                                                        | Cause                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OIDC unavailable: add permissions: id-token: write to the job`              | The job can't request an OIDC token. Add the permission. Fork PRs on `pull_request` never get it.                                                                                                                                                           |
+| `OIDC token request failed: <status>`                                        | The runner's token endpoint refused the request, or still failed after 3 tries.                                                                                                                                                                             |
+| `cloudflare-sts broker returned 400 (invalid_request: …)`                    | The broker rejected the OIDC token, usually because `url` doesn't match the GitHub provider's `audience` in the policy; or no profile allows this workflow, or a named scope isn't one the workflow can have (`invalid_scope`). The description says which. |
+| `cloudflare-sts broker returned 503 (temporarily_unavailable: …)`            | The Cloudflare API or the subject token's issuer failed; the broker's log (`token.deny`) says which. For a profile with a `bucket`, it's usually a Cloudflare token without enough R2 permissions on it.                                                    |
+| `cloudflare-sts broker returned 500 (server_error: …)`                       | The broker's policy or bindings are invalid. The broker's logs say why.                                                                                                                                                                                     |
+| `cloudflare-sts broker returned 404: the broker doesn't serve /oauth/token…` | `url` isn't the broker, or the broker is from an older release than the action. Deploy the broker from the action's release.                                                                                                                                |
+| `cloudflare-sts broker returned an invalid response: missing …`              | The broker answered `200` without what the action needs: a broker from another release, or something else at `url`.                                                                                                                                         |
+| `url must use https`                                                         | Plain `http` is only accepted for `localhost`, `127.0.0.1` and `[::1]`.                                                                                                                                                                                     |
+| `AccessDenied` from S3 on some keys                                          | The credentials only cover the bucket's prefixes: keep every key under `$CLOUDFLARE_R2_PREFIX`.                                                                                                                                                             |
 
 ## Limitations
 
 - **R2 credentials can't be revoked.** They expire at the end of their TTL.
-- **One token per job.** Every step in a job can read the runner, so a second scope in the same job wouldn't be isolated. Use two jobs.
+- **One token per job.** Every step in a job can read the runner, so a second run of the action in the same job wouldn't be isolated. Ask for several profiles in one `scopes` list when one step needs them together, or use two jobs to keep them apart.
 - **No outputs.** The values are in `env`; outputs would just be a second name for them.
 - **Masking isn't isolation.** The token is hidden in logs, but any step in the job, including third-party actions and PR code, can use it until the post step revokes it. Keep profiles for prod behind `environment` protection.
 - **Needs a `node24` runner.** The action runs straight from the tag's checkout, with no build step and nothing installed.

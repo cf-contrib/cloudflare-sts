@@ -80,9 +80,15 @@ model TokenExchangeRequest {
    */
   requested_token_type?: IssuedTokenType;
 
-  /** Profile to use. If omitted, exactly one profile must match. */
-  @maxLength(255)
-  profile?: string;
+  /**
+   * The profiles to get, as a space-delimited list (RFC 6749 §3.3, RFC 8693 §2.1). The
+   * caller must be allowed every one, or the request is `invalid_scope` and nothing is
+   * issued. Profiles for the Cloudflare audience are combined into one grant: their token
+   * policies together, and at most one bucket. A profile for another service's audience
+   * can't be combined. If omitted, exactly one profile must match.
+   */
+  @maxLength(1024)
+  scope?: string;
 
   /**
    * Requested lifetime such as `10m` or `1h`, capped at the profile's `max_ttl`. If
@@ -130,8 +136,8 @@ model TokenExchangeResponse {
   /** The Cloudflare account, for the Cloudflare audience. */
   account_id?: string;
 
-  /** The profile that allowed the exchange. */
-  profile: string;
+  /** The profiles that were granted, space-delimited (RFC 8693 §2.2.1). */
+  scope: string;
 
   /** The R2 credentials, for a profile with a bucket. */
   bucket?: BucketCredentials;
@@ -239,6 +245,7 @@ model Error {
  */
 enum ErrorCode {
   invalid_request,
+  invalid_scope,
   invalid_target,
   unsupported_grant_type,
   server_error,
@@ -298,12 +305,13 @@ model TokenIssued {
 @tag("TokenService")
 interface TokenService {
   /**
-   * The subject token is in the body, not an `Authorization` header. Which profile
-   * applies follows the policy: a named `profile` must match, otherwise exactly one
-   * profile must. Anything unsupported, such as `actor_token`, is refused rather than
-   * ignored. An invalid subject token, or one the policy doesn't take, is
-   * `invalid_request`, as RFC 8693 §2.2.2 has it; an `audience` the broker issues
-   * nothing for is `invalid_target`.
+   * The subject token is in the body, not an `Authorization` header. Which profiles
+   * apply follows the policy: every profile named in `scope` must match the caller,
+   * otherwise exactly one profile must. Anything unsupported, such as `actor_token`, is
+   * refused rather than ignored. An invalid subject token, or one the policy doesn't take,
+   * is `invalid_request`, as RFC 8693 §2.2.2 has it; an `audience` the broker issues
+   * nothing for is `invalid_target`, and a `scope` that names an unknown profile, or one
+   * the caller can't have, or profiles that can't be combined, is `invalid_scope`.
    */
   @summary("Exchange an OIDC token for a Cloudflare API token and/or R2 credentials.")
   @operationId("exchangeToken")

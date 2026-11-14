@@ -74,8 +74,8 @@ export function startStub({
       // 2026-09-28T12:15:00Z, like the stub bucket's expires_on.
       const expires = { expires_in: 900, expires_at: 1790597700 };
       const r2 = { ...expires, issued_token_type: R2_CREDENTIALS, token_type: "N_A", account_id: STUB_ACCOUNT_ID };
-      if (body?.profile === STUB_R2_PROFILE) {
-        return send(200, { ...r2, profile: STUB_R2_PROFILE, bucket: STUB_BUCKET, ...tokenFields });
+      if (body?.scope === STUB_R2_PROFILE) {
+        return send(200, { ...r2, scope: STUB_R2_PROFILE, bucket: STUB_BUCKET, ...tokenFields });
       }
       return send(200, {
         access_token: STUB_TOKEN,
@@ -84,7 +84,7 @@ export function startStub({
         ...expires,
         token_id: STUB_TOKEN_ID,
         account_id: STUB_ACCOUNT_ID,
-        profile: body?.profile ?? "default",
+        scope: body?.scope ?? "default",
         ...tokenFields,
       });
     }

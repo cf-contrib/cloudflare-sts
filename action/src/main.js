@@ -41,7 +41,8 @@ try {
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
     subject_token: jwt,
     subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-    profile: input("profile") || undefined,
+    // The profiles, separated by spaces or newlines, are sent as one space-delimited `scope` (RFC 6749 §3.3).
+    scope: input("scopes").split(/\s+/).filter(Boolean).join(" ") || undefined,
     ttl: input("ttl") || undefined,
   };
 
@@ -94,7 +95,7 @@ try {
     write("GITHUB_ENV", "CLOUDFLARE_API_TOKEN", t.access_token);
     write("GITHUB_STATE", "token", t.access_token); // read by post.js as STATE_token
     write("GITHUB_STATE", "token_id", t.token_id);
-    console.log(`cloudflare-sts: minted token ${t.token_id} (profile ${t.profile}, expires ${rfc3339(t.expires_at)})`);
+    console.log(`cloudflare-sts: minted token ${t.token_id} (scope ${t.scope}, expires ${rfc3339(t.expires_at)})`);
   }
 
   if (b !== undefined) {
@@ -114,7 +115,7 @@ try {
     write("GITHUB_STATE", "r2_expires_on", b.expires_on);
     const scope = b.prefixes.length > 0 ? ` under ${b.prefixes.join(", ")}` : "";
     console.log(
-      `cloudflare-sts: issued R2 credentials for bucket ${b.name}${scope} (profile ${t.profile}, expires ${b.expires_on})`,
+      `cloudflare-sts: issued R2 credentials for bucket ${b.name}${scope} (scope ${t.scope}, expires ${b.expires_on})`,
     );
   }
 } catch (err) {

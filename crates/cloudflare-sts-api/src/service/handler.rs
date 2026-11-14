@@ -44,7 +44,9 @@ use serde_json::json;
 use tracing::{error, info, warn};
 use worker::{Date, send::SendFuture};
 
-use super::config::{BucketPermission, CLOUDFLARE_AUDIENCE, Config, ProfileConfig, ProviderConfig};
+use super::config::{
+    BucketPermission, CLOUDFLARE_AUDIENCE, Config, ProfileConfig, ProviderConfig, Refusal,
+};
 use crate::oidc::{self, AccessTokenClaims, Jwt, SigningKey};
 
 /// The token exchange grant, RFC 8693's.
@@ -191,7 +193,7 @@ impl TokenServiceHandler {
             expires_at: expires_at as i64,
             expires_in: expires_at.saturating_sub(now) as i64,
             issued_token_type,
-            profile: profile.name.clone(),
+            scope: profile.name.clone(),
             token_id: None,
             token_type: TokenType::Bearer,
         })
@@ -389,7 +391,7 @@ impl TokenServiceHandler {
             expires_at,
             expires_in: (expires_at - now as i64).max(0),
             issued_token_type,
-            profile: profile.name.clone(),
+            scope: profile.name.clone(),
             token_id,
             token_type,
         })
@@ -405,7 +407,7 @@ impl TokenServiceApi for TokenServiceHandler {
         SendFuture::new(async move {
             let policy = self.config.policy();
             let mut caller: Option<(Jwt, &ProviderConfig)> = None;
-            let mut named: Option<&ProfileConfig> = None;
+            let mut named: Option<ProfileConfig> = None;
             let exchanged = async {
                 // What the generated validation can't check: the audience,
                 // and whether what's asked for can be issued for it.
@@ -467,15 +469,20 @@ impl TokenServiceApi for TokenServiceHandler {
                     .map_err(|why| invalid_request(&why))?;
                 let (identity, provider) = &*caller.insert((identity, provider));
 
+                // The scopes asked for are profiles, a space-delimited list.
+                let scopes: Vec<&str> = request
+                    .scope
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .collect();
                 let (profile, allowed_by) = policy
-                    .profile_for(
-                        &provider.name,
-                        &identity.claims,
-                        request.profile.as_deref(),
-                        audience,
-                    )
-                    .map_err(|why| invalid_request(&why))?;
-                named = Some(profile);
+                    .profiles_for(&provider.name, &identity.claims, &scopes, audience)
+                    .map_err(|refusal| match refusal {
+                        Refusal::Scope(why) => Error::new(ErrorCode::InvalidScope, why),
+                        Refusal::Request(why) => invalid_request(&why),
+                    })?;
+                let profile = &*named.insert(profile);
                 info!(
                     event = "policy.allow",
                     provider = %provider.name,
@@ -506,14 +513,15 @@ impl TokenServiceApi for TokenServiceHandler {
                 Ok(response) => v1::ExchangeTokenResponse::Ok(response),
                 Err(err) => {
                     let profile = named
+                        .as_ref()
                         .map(|p| p.name.as_str())
-                        .or(request.profile.as_deref());
+                        .or(request.scope.as_deref());
                     warn!(
                         event = "token.deny",
                         provider = caller.as_ref().map(|(_, provider)| provider.name.as_str()),
                         profile,
                         sub = caller.as_ref().and_then(|(identity, _)| identity.claims.sub()),
-                        claims = caller.as_ref().zip(named).map(|((identity, _), profile)| {
+                        claims = caller.as_ref().zip(named.as_ref()).map(|((identity, _), profile)| {
                             display(serde_json::Value::Object(profile.forwarded_claims(&identity.claims)))
                         }),
                         error = err.error.as_str(),
@@ -523,6 +531,7 @@ impl TokenServiceApi for TokenServiceHandler {
                     // broker's doesn't: the log line does.
                     match err.error {
                         ErrorCode::InvalidRequest
+                        | ErrorCode::InvalidScope
                         | ErrorCode::InvalidTarget
                         | ErrorCode::UnsupportedGrantType => {
                             v1::ExchangeTokenResponse::BadRequest(err)
@@ -614,6 +623,7 @@ impl TokenServiceApi for TokenServiceHandler {
                     // the log line.
                     match err.error {
                         ErrorCode::InvalidRequest
+                        | ErrorCode::InvalidScope
                         | ErrorCode::InvalidTarget
                         | ErrorCode::UnsupportedGrantType => {
                             v1::RevokeTokenResponse::BadRequest(err)

@@ -44,14 +44,14 @@ mod token_exchange_for_jobs {
         let before = now();
         let res = job_token(
             &sign(github_claims(json!({}))),
-            &[("profile", "workers-deploy")],
+            &[("scope", "workers-deploy")],
         )
         .await;
         assert_eq!(res.status, 200, "{}", res.text);
         assert_eq!(res.cache_control.as_deref(), Some("no-store"));
 
         let body = res.json();
-        assert_eq!(body["profile"], "workers-deploy");
+        assert_eq!(body["scope"], "workers-deploy");
         assert_eq!(body["account_id"], ACCOUNT_ID);
         assert!(body["access_token"].as_str().unwrap().starts_with("value-"));
         assert_matches(
@@ -85,7 +85,7 @@ mod token_exchange_for_jobs {
         let _t = start().await;
         let res = job_token(&sign(github_claims(json!({}))), &[]).await;
         assert_eq!(res.status, 200);
-        assert_eq!(res.json()["profile"], "workers-deploy");
+        assert_eq!(res.json()["scope"], "workers-deploy");
     }
 
     #[tokio::test]
@@ -94,10 +94,10 @@ mod token_exchange_for_jobs {
         let claims = github_claims(
             json!({ "repository": "example-org/infra", "repository_id": "200000002" }),
         );
-        let res = job_token(&sign(claims), &[("profile", "example-org/infra:ci.apply")]).await;
+        let res = job_token(&sign(claims), &[("scope", "example-org/infra:ci.apply")]).await;
         assert_eq!(res.status, 200);
         // The form body percent-encodes `/` and `:`; the name arrives intact.
-        assert_eq!(res.json()["profile"], "example-org/infra:ci.apply");
+        assert_eq!(res.json()["scope"], "example-org/infra:ci.apply");
         assert_eq!(
             minted_policies(&token_id(&res)),
             json!([{
@@ -196,25 +196,25 @@ mod token_exchange_for_jobs {
         let t = start().await;
         let res = job_token(
             &sign(github_claims(json!({}))),
-            &[("profile", "example-org/infra:ci.apply")],
+            &[("scope", "example-org/infra:ci.apply")],
         )
         .await;
         assert_eq!(res.status, 400);
         let deny = t.deny().await;
         assert_matches(&deny, json!({ "profile": "example-org/infra:ci.apply" }));
-        assert_refused(&deny, "invalid_request", "profile ");
+        assert_refused(&deny, "invalid_scope", "scope ");
     }
 
     #[tokio::test]
     async fn rejects_bad_fields() {
         let _t = start().await;
-        let long = "x".repeat(256);
+        let long = "x".repeat(1025);
         let jwt = sign(github_claims(json!({})));
         let cases: [&[(&str, &str)]; 4] = [
             &[("ttl", "forever")],
             &[("ttl", "600")],
-            &[("profile", "a"), ("profile", "b")],
-            &[("profile", &long)],
+            &[("scope", "a"), ("scope", "b")],
+            &[("scope", &long)],
         ];
         for fields in cases {
             assert_eq!(job_token(&jwt, fields).await.status, 400, "{fields:?}");
@@ -308,7 +308,7 @@ mod token_exchange_for_jobs_with_a_bucket {
         let before = now();
         let res = job_token(
             &state_repo("state", json!({})),
-            &[("profile", "terraform-state")],
+            &[("scope", "terraform-state")],
         )
         .await;
         assert_eq!(res.status, 200, "{}", res.text);
@@ -322,7 +322,7 @@ mod token_exchange_for_jobs_with_a_bucket {
                 "expires_in": body["expires_in"],
                 "expires_at": body["expires_at"],
                 "account_id": ACCOUNT_ID,
-                "profile": "terraform-state",
+                "scope": "terraform-state",
                 "bucket": {
                     "name": "org-terraform-state",
                     "access_key_id": CLOUDFLARE_TOKEN_ID,
@@ -557,7 +557,7 @@ mod exchange_requests {
         let before = now();
         let res = job_token(
             &sign(github_claims(json!({}))),
-            &[("profile", "workers-deploy")],
+            &[("scope", "workers-deploy")],
         )
         .await;
         assert_eq!(res.status, 200);
@@ -572,7 +572,7 @@ mod exchange_requests {
                 "expires_at": body["expires_at"],
                 "token_id": body["token_id"],
                 "account_id": ACCOUNT_ID,
-                "profile": "workers-deploy",
+                "scope": "workers-deploy",
             })
         );
         let expires_in = body["expires_in"].as_u64().unwrap();
@@ -599,7 +599,7 @@ mod exchange_requests {
         )
         .await;
         assert_eq!(res.status, 200, "{}", res.text);
-        assert_eq!(res.json()["profile"], "workers-deploy");
+        assert_eq!(res.json()["scope"], "workers-deploy");
     }
 
     #[tokio::test]
@@ -763,7 +763,7 @@ mod people {
         let t = start().await;
         let res = job_token(
             &id_token("alice@example.com"),
-            &[("profile", "example-org/app:tofu-plan")],
+            &[("scope", "example-org/app:tofu-plan")],
         )
         .await;
         assert_eq!(res.status, 200, "{}", res.text);
@@ -786,14 +786,14 @@ mod people {
         let t = start().await;
         let res = job_token(
             &id_token("alice@example.com"),
-            &[("profile", "example-org/infra:ci.apply")],
+            &[("scope", "example-org/infra:ci.apply")],
         )
         .await;
         assert_eq!(res.status, 400);
         assert_refused(
             &t.deny().await,
-            "invalid_request",
-            "profile example-org/infra:ci.apply isn't for provider access",
+            "invalid_scope",
+            "scope example-org/infra:ci.apply isn't for provider access",
         );
     }
 
@@ -842,7 +842,7 @@ mod providers {
         let (t, gitlab) = setup().await;
         let res = job_token(&gitlab_token(&gitlab, gitlab_claims(json!({}))), &[]).await;
         assert_eq!(res.status, 200, "{}", res.text);
-        assert_eq!(res.json()["profile"], "gitlab-deploy");
+        assert_eq!(res.json()["scope"], "gitlab-deploy");
         // Named after the provider and the token's subject: GitLab's has no repo or run.
         assert_eq!(
             world().cloudflare.tokens[&token_id(&res)].name,
@@ -877,14 +877,14 @@ mod providers {
         let (t, gitlab) = setup().await;
         let res = job_token(
             &gitlab_token(&gitlab, gitlab_claims(json!({}))),
-            &[("profile", "workers-deploy")],
+            &[("scope", "workers-deploy")],
         )
         .await;
         assert_eq!(res.status, 400);
         assert_refused(
             &t.deny().await,
-            "invalid_request",
-            "profile workers-deploy isn't for provider gitlab",
+            "invalid_scope",
+            "scope workers-deploy isn't for provider gitlab",
         );
     }
 
@@ -930,7 +930,7 @@ mod providers {
         let pinned = gitlab_token(&issuer("pinned"), gitlab_claims(json!({})));
         let res = job_token(&pinned, &[("audience", CACHE)]).await;
         assert_eq!(res.status, 200, "{}", res.text);
-        assert_eq!(res.json()["profile"], "pinned-cache");
+        assert_eq!(res.json()["scope"], "pinned-cache");
     }
 
     #[tokio::test]
@@ -952,11 +952,7 @@ mod providers {
     async fn fills_bucket_prefixes_from_another_issuers_claims() {
         let (_t, gitlab) = setup().await;
         let claims = gitlab_claims(json!({ "project_path": "group/sub/app" }));
-        let res = job_token(
-            &gitlab_token(&gitlab, claims),
-            &[("profile", "gitlab-state")],
-        )
-        .await;
+        let res = job_token(&gitlab_token(&gitlab, claims), &[("scope", "gitlab-state")]).await;
         assert_eq!(res.status, 200, "{}", res.text);
         assert_eq!(
             res.json()["bucket"]["prefixes"],
@@ -1026,7 +1022,7 @@ mod tokens_for_other_services {
                 "token_type": "Bearer",
                 "expires_in": body["expires_in"],
                 "expires_at": body["expires_at"],
-                "profile": "nix-push",
+                "scope": "nix-push",
             })
         );
         let (header, claims) = verify_broker_token(body["access_token"].as_str().unwrap()).await;
@@ -1145,14 +1141,14 @@ mod tokens_for_other_services {
         let res = for_cache(
             &sign(github_claims(json!({}))),
             ID_TOKEN,
-            &[("profile", "workers-deploy")],
+            &[("scope", "workers-deploy")],
         )
         .await;
         assert_eq!(res.status, 400);
         assert_refused(
             &t.deny().await,
-            "invalid_request",
-            &format!("profile workers-deploy isn't for {CACHE}"),
+            "invalid_scope",
+            &format!("scope workers-deploy isn't for {CACHE}"),
         );
     }
 
@@ -1220,4 +1216,79 @@ async fn the_scheduled_cleanup_deletes_only_expired_broker_tokens() {
             .iter()
             .any(|r| r.method == "GET" && r.path.ends_with("/tokens"))
     );
+}
+
+mod several_scopes {
+    use super::*;
+
+    /// A job in the environment the `combo-*` profiles are for.
+    fn combo() -> String {
+        sign(github_claims(json!({ "environment": "combo" })))
+    }
+
+    #[tokio::test]
+    async fn combines_tokens_and_a_bucket_into_one_grant() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-deploy combo-lb combo-state")]).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        let body = res.json();
+        assert_eq!(body["scope"], "combo-deploy combo-lb combo-state");
+        assert!(body["access_token"].as_str().unwrap().starts_with("value-"));
+        assert_eq!(body["bucket"]["name"], "org-terraform-state");
+        // One token with both profiles' policies, and one set of bucket credentials
+        assert_eq!(
+            minted_policies(&token_id(&res)).as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(token_count(), 2); // the Cloudflare token, and the one minted
+        assert_eq!(r2_bodies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn takes_each_scope_once_in_the_order_given() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-lb  combo-deploy combo-lb")]).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        assert_eq!(res.json()["scope"], "combo-lb combo-deploy");
+    }
+
+    #[tokio::test]
+    async fn refuses_two_buckets_without_calling_cloudflare() {
+        let t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-state combo-state-two")]).await;
+        assert_eq!(res.status, 400);
+        assert_error(&res, "invalid_scope");
+        assert_refused(
+            &t.deny().await,
+            "invalid_scope",
+            "each have a bucket, and R2 credentials are for one",
+        );
+        assert!(world().cloudflare.calls().is_empty());
+        assert_eq!(token_count(), 1); // only the Cloudflare token
+    }
+
+    #[tokio::test]
+    async fn refuses_them_all_when_one_isnt_allowed() {
+        let t = start().await;
+        // `workers-deploy` is for the prod environment, not this one
+        let res = job_token(&combo(), &[("scope", "combo-deploy workers-deploy")]).await;
+        assert_eq!(res.status, 400);
+        assert_error(&res, "invalid_scope");
+        assert_refused(
+            &t.deny().await,
+            "invalid_scope",
+            "scope workers-deploy doesn't match the token",
+        );
+        assert!(world().cloudflare.calls().is_empty());
+        assert_eq!(token_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_scope_as_invalid_scope() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-deploy nope")]).await;
+        assert_eq!(res.status, 400);
+        assert_error(&res, "invalid_scope");
+        assert!(world().cloudflare.calls().is_empty());
+    }
 }

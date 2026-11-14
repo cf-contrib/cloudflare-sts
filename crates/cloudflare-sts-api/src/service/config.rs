@@ -405,21 +405,24 @@ impl PolicyConfig {
         })
     }
 
-    /// The profile a token from `provider` with `claims` gets for
-    /// `audience`: the one `requested`, or else the only one the Cedar policy
-    /// allows. Whether its provider lets it in was checked when it was
-    /// verified.
+    /// The profile a caller gets: the ones `requested` names (the request's
+    /// `scope`), each of which its token must be allowed, or the only one
+    /// it's allowed when none is named. Several are combined into one, as
+    /// [`ProfileConfig::combined`] says. Whether its provider lets it in was
+    /// checked when it was verified.
     ///
     /// # Errors
     ///
-    /// Why it gets none.
-    pub fn profile_for(
+    /// Why it gets none: [`Refusal::Scope`] when a scope can't be had,
+    /// [`Refusal::Request`] when none was named and the token doesn't
+    /// settle on one.
+    pub fn profiles_for(
         &self,
         provider: &str,
         claims: &Map<String, Value>,
-        requested: Option<&str>,
+        requested: &[&str],
         audience: &str,
-    ) -> Result<(&ProfileConfig, Vec<String>), String> {
+    ) -> Result<(ProfileConfig, Vec<String>), Refusal> {
         // The `@id`s of the policies that allowed it, if any did. A `forbid`
         // that fired is logged: the caller is only told nothing matched.
         let matches = |p: &ProfileConfig| -> Option<Vec<String>> {
@@ -435,42 +438,68 @@ impl PolicyConfig {
             }
             None
         };
-        let mut profiles = self
+        let profiles = self
             .profiles
             .iter()
             .filter(|p| p.provider == provider && p.audience == audience);
 
-        if let Some(requested) = requested {
-            if let Some(profile) = profiles.find(|p| p.name == requested)
-                && let Some(policies) = matches(profile)
-            {
-                return Ok((profile, policies));
+        if !requested.is_empty() {
+            // Each scope once, in the order given.
+            let mut names: Vec<&str> = Vec::new();
+            for name in requested {
+                if !names.contains(name) {
+                    names.push(name);
+                }
             }
-            return Err(match self.profiles.iter().find(|p| p.name == requested) {
-                None => format!("unknown profile {requested}"),
-                Some(named) if named.provider != provider => {
-                    format!("profile {requested} isn't for provider {provider}")
+            let mut granted: Vec<(&ProfileConfig, Vec<String>)> = Vec::new();
+            for name in names {
+                if let Some(profile) = profiles.clone().find(|p| p.name == name)
+                    && let Some(policies) = matches(profile)
+                {
+                    granted.push((profile, policies));
+                    continue;
                 }
-                Some(named) if named.audience != audience => {
-                    format!("profile {requested} isn't for {audience}")
-                }
-                Some(named) if !named.enabled => format!("profile {requested} is disabled"),
-                Some(_) => format!("profile {requested} doesn't match the token"),
-            });
+                return Err(Refusal::Scope(
+                    match self.profiles.iter().find(|p| p.name == name) {
+                        None => format!("unknown scope {name}"),
+                        Some(named) if named.provider != provider => {
+                            format!("scope {name} isn't for provider {provider}")
+                        }
+                        Some(named) if named.audience != audience => {
+                            format!("scope {name} isn't for {audience}")
+                        }
+                        Some(named) if !named.enabled => format!("scope {name} is disabled"),
+                        Some(_) => format!("scope {name} doesn't match the token"),
+                    },
+                ));
+            }
+            let allowed_by = granted
+                .iter()
+                .flat_map(|(_, policies)| policies.iter().cloned())
+                .fold(Vec::<String>::new(), |mut all, id| {
+                    if !all.contains(&id) {
+                        all.push(id);
+                    }
+                    all
+                });
+            let combined =
+                ProfileConfig::combined(&granted.iter().map(|(p, _)| *p).collect::<Vec<_>>())
+                    .map_err(Refusal::Scope)?;
+            return Ok((combined, allowed_by));
         }
 
         let candidates: Vec<(&ProfileConfig, Vec<String>)> = profiles
             .filter_map(|p| matches(p).map(|policies| (p, policies)))
             .collect();
         match candidates.as_slice() {
-            [] => Err("no profile matches the token".into()),
-            [(profile, policies)] => Ok((*profile, policies.clone())),
+            [] => Err(Refusal::Request("no profile matches the token".into())),
+            [(profile, policies)] => Ok(((*profile).clone(), policies.clone())),
             several => {
                 let names: Vec<&str> = several.iter().map(|(p, _)| p.name.as_str()).collect();
-                Err(format!(
-                    "profiles {} all match the token: name one",
+                Err(Refusal::Request(format!(
+                    "profiles {} all match the token: name one in scope",
                     names.join(", ")
-                ))
+                )))
             }
         }
     }
@@ -575,8 +604,18 @@ impl ProviderConfig {
     }
 }
 
+/// Why a caller gets no profile.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// A scope it asked for can't be had, or the scopes can't be combined:
+    /// RFC 6749's `invalid_scope`.
+    Scope(String),
+    /// It named none, and the token doesn't settle on one.
+    Request(String),
+}
+
 /// What a caller may get, and who may get it.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     pub name: String,
@@ -684,6 +723,72 @@ impl ProfileConfig {
         }
     }
 
+    /// One profile that grants what all of `profiles` do, for a request that
+    /// names several scopes. They are for Cloudflare, and their token
+    /// policies add up to one token. A bucket's credentials are for one
+    /// bucket, so at most one profile may have one. The TTLs are the
+    /// shortest, so nothing outlives what any of them allows. The name is
+    /// the scopes, space-delimited, which is what the response says was
+    /// granted.
+    ///
+    /// # Errors
+    ///
+    /// Why they can't be combined.
+    fn combined(profiles: &[&ProfileConfig]) -> Result<ProfileConfig, String> {
+        let [first, rest @ ..] = profiles else {
+            return Err("no scope".into());
+        };
+        if rest.is_empty() {
+            return Ok((*first).clone());
+        }
+        let names = profiles.iter().map(|p| p.name.as_str());
+        if first.audience != CLOUDFLARE_AUDIENCE {
+            // The broker's own token carries one profile's claims.
+            return Err(format!(
+                "scopes {} are for {}, which takes one scope",
+                names.collect::<Vec<_>>().join(", "),
+                first.audience
+            ));
+        }
+        let with_bucket: Vec<&str> = profiles
+            .iter()
+            .filter(|p| p.bucket.is_some())
+            .map(|p| p.name.as_str())
+            .collect();
+        if with_bucket.len() > 1 {
+            return Err(format!(
+                "scopes {} each have a bucket, and R2 credentials are for one: ask for one of them",
+                with_bucket.join(", ")
+            ));
+        }
+        let mut forward_claims: Vec<String> = Vec::new();
+        for claim in profiles.iter().flat_map(|p| &p.forward_claims) {
+            if !forward_claims.contains(claim) {
+                forward_claims.push(claim.clone());
+            }
+        }
+        let policies: Vec<TokenPolicyConfig> = profiles
+            .iter()
+            .filter_map(|p| p.token.as_ref())
+            .flat_map(|t| t.policies.iter().cloned())
+            .collect();
+        Ok(ProfileConfig {
+            name: names.collect::<Vec<_>>().join(" "),
+            provider: first.provider.clone(),
+            enabled: true,
+            audience: first.audience.clone(),
+            forward_claims,
+            ttl: profiles.iter().map(|p| p.ttl).min().unwrap_or(first.ttl),
+            max_ttl: profiles
+                .iter()
+                .map(|p| p.max_ttl)
+                .min()
+                .unwrap_or(first.max_ttl),
+            token: (!policies.is_empty()).then_some(TokenConfig { policies }),
+            bucket: profiles.iter().find_map(|p| p.bucket.clone()),
+        })
+    }
+
     fn check(&self, at: &str, issuer: &str, account_id: &str) -> Result<(), String> {
         check_profile_name(&self.name).map_err(|why| format!("{at}.name {why}"))?;
         check_forward_claims(&self.forward_claims)
@@ -727,7 +832,7 @@ impl ProfileConfig {
 
 /// A Cloudflare API token: its policies, in Cloudflare's own format, with
 /// permission groups by name.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenConfig {
     pub policies: Vec<TokenPolicyConfig>,
@@ -759,7 +864,7 @@ impl TokenConfig {
 }
 
 /// One of a token's policies.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TokenPolicyConfig {
     #[serde(default)]
@@ -949,7 +1054,7 @@ pub enum ResourceValue {
 }
 
 /// A bucket a profile's caller gets R2 credentials for.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BucketConfig {
     pub name: String,
@@ -1001,11 +1106,11 @@ impl BucketPermission {
 /// The prefix is all that keeps one caller out of another's keys, so a
 /// placeholder fills whole path segments, the template ends with `/`, and
 /// what fills it is checked as strictly as the template was.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(try_from = "String")]
 pub struct PrefixTemplate(Vec<Segment>);
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Segment {
     Text(String),
     Claim(String),
@@ -1763,9 +1868,23 @@ pub(super) mod tests {
         requested: Option<&str>,
         audience: &str,
     ) -> Result<String, String> {
+        let scopes: Vec<&str> = requested.into_iter().collect();
+        scoped(policy, claims, &scopes, audience)
+    }
+
+    /// The same for several scopes: the combined profile's name, or why not.
+    fn scoped(
+        policy: &Value,
+        claims: Map<String, Value>,
+        scopes: &[&str],
+        audience: &str,
+    ) -> Result<String, String> {
         parse(policy)
-            .profile_for("github", &claims, requested, audience)
-            .map(|(profile, _)| profile.name.clone())
+            .profiles_for("github", &claims, scopes, audience)
+            .map(|(profile, _)| profile.name)
+            .map_err(|refusal| match refusal {
+                Refusal::Scope(why) | Refusal::Request(why) => why,
+            })
     }
 
     fn ok(name: &str) -> Result<String, String> {
@@ -1799,19 +1918,19 @@ pub(super) mod tests {
                 dev,
                 Some("deploy"),
                 CLOUDFLARE_AUDIENCE,
-                "profile deploy doesn't match the token",
+                "scope deploy doesn't match the token",
             ),
             (
                 main.clone(),
                 Some("nope"),
                 CLOUDFLARE_AUDIENCE,
-                "unknown profile nope",
+                "unknown scope nope",
             ),
             (
                 main,
                 Some("deploy"),
                 CACHE,
-                "profile deploy isn't for https://cloudflare-nix-api.example.com",
+                "scope deploy isn't for https://cloudflare-nix-api.example.com",
             ),
         ];
         for (claims, requested, audience, expected) in cases {
@@ -1822,6 +1941,132 @@ pub(super) mod tests {
         }
     }
 
+    /// The test policy with two more Cloudflare profiles: `dns`, a token, and
+    /// `state`, a bucket.
+    fn with_more() -> Value {
+        let mut policy = policy();
+        let profiles = policy["profiles"].as_array_mut().unwrap();
+        profiles.push(json!({
+            "name": "dns",
+            "ttl": "10m",
+            "max_ttl": "30m",
+            "token": { "policies": [{ "permissions": ["DNS Write"], "resources": { (format!("com.cloudflare.api.account.{ACCOUNT_ID}")): "*" } }] },
+        }));
+        profiles.push(json!({
+            "name": "state",
+            "bucket": { "name": "org-state", "permission": "object-read-write" },
+        }));
+        policy
+    }
+
+    #[test]
+    fn combines_several_scopes_into_one_grant() {
+        let policy = with_more();
+        assert_eq!(
+            scoped(&policy, claims(), &["deploy", "state"], CLOUDFLARE_AUDIENCE),
+            ok("deploy state")
+        );
+        // Each once, in the order given, whatever the spacing
+        assert_eq!(
+            scoped(
+                &policy,
+                claims(),
+                &["dns", "deploy", "dns"],
+                CLOUDFLARE_AUDIENCE
+            ),
+            ok("dns deploy")
+        );
+
+        let (profile, allowed_by) = parse(&policy)
+            .profiles_for(
+                "github",
+                &claims(),
+                &["deploy", "dns", "state"],
+                CLOUDFLARE_AUDIENCE,
+            )
+            .unwrap();
+        // The token policies add up; the bucket is the one there is
+        assert_eq!(profile.token.as_ref().unwrap().policies.len(), 2);
+        assert_eq!(profile.bucket.as_ref().unwrap().name, "org-state");
+        // The shortest TTLs win, so nothing outlives what any scope allows
+        let policy = parse(&policy);
+        let shortest = policy.profiles.iter().map(|p| p.ttl).min().unwrap();
+        let tightest = policy.profiles.iter().map(|p| p.max_ttl).min().unwrap();
+        assert_eq!((profile.ttl, profile.max_ttl), (shortest, tightest));
+        assert_eq!(
+            allowed_by,
+            ["allow-deploy", "allow-dns", "allow-state"],
+            "every policy that allowed a scope"
+        );
+    }
+
+    #[test]
+    fn one_scope_that_cant_be_had_refuses_them_all() {
+        let policy = with_more();
+        let mut dev = claims();
+        dev.insert("ref".into(), "refs/heads/dev".into());
+        // `dns` and `state` take any main; `deploy` needs main in the org: all are refused
+        // for a branch that isn't main, and one unknown name refuses the rest.
+        assert_eq!(
+            scoped(&policy, dev, &["dns", "deploy"], CLOUDFLARE_AUDIENCE),
+            err("scope dns doesn't match the token")
+        );
+        assert_eq!(
+            scoped(&policy, claims(), &["dns", "nope"], CLOUDFLARE_AUDIENCE),
+            err("unknown scope nope")
+        );
+    }
+
+    #[test]
+    fn scopes_that_cant_be_combined_are_refused() {
+        let mut policy = with_more();
+        policy["profiles"].as_array_mut().unwrap().push(json!({
+            "name": "state-two",
+            "bucket": { "name": "org-other", "permission": "object-read-only" },
+        }));
+        assert_eq!(
+            scoped(
+                &policy,
+                claims(),
+                &["state", "state-two"],
+                CLOUDFLARE_AUDIENCE
+            ),
+            err(
+                "scopes state, state-two each have a bucket, and R2 credentials are for one: ask for one of them"
+            )
+        );
+
+        // The broker's own token is for one profile, so two for a service are refused
+        let mut policy = policy;
+        policy["profiles"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "name": "nix-pull", "audience": CACHE, "forward_claims": ["ref"] }));
+        assert_eq!(
+            scoped(&policy, claims(), &["nix-push", "nix-pull"], CACHE),
+            err(&format!(
+                "scopes nix-push, nix-pull are for {CACHE}, which takes one scope"
+            ))
+        );
+        assert_eq!(
+            scoped(&policy, claims(), &["nix-push"], CACHE),
+            ok("nix-push")
+        );
+    }
+
+    #[test]
+    fn naming_no_scope_is_a_request_problem_and_a_bad_scope_a_scope_problem() {
+        let policy = parse(&with_more());
+        assert!(matches!(
+            policy.profiles_for("github", &claims(), &[], CLOUDFLARE_AUDIENCE),
+            Err(Refusal::Request(_))
+        ));
+        assert!(matches!(
+            policy.profiles_for("github", &claims(), &["nope"], CLOUDFLARE_AUDIENCE),
+            Err(Refusal::Scope(_))
+        ));
+    }
+
     #[test]
     fn refuses_when_several_profiles_match_and_none_is_named() {
         let mut policy = policy();
@@ -1830,7 +2075,7 @@ pub(super) mod tests {
         policy["profiles"].as_array_mut().unwrap().push(again);
         assert_eq!(
             selected(&policy, claims(), None, CLOUDFLARE_AUDIENCE),
-            err("profiles deploy, deploy-again all match the token: name one")
+            err("profiles deploy, deploy-again all match the token: name one in scope")
         );
         assert_eq!(
             selected(&policy, claims(), Some("deploy-again"), CLOUDFLARE_AUDIENCE),
@@ -1844,7 +2089,7 @@ pub(super) mod tests {
         policy["profiles"][0]["enabled"] = json!(false);
         assert_eq!(
             selected(&policy, claims(), Some("deploy"), CLOUDFLARE_AUDIENCE),
-            err("profile deploy is disabled")
+            err("scope deploy is disabled")
         );
         assert_eq!(
             selected(&policy, claims(), None, CLOUDFLARE_AUDIENCE),
@@ -1860,7 +2105,7 @@ pub(super) mod tests {
         policy["profiles"][1]["provider"] = json!("github");
         assert_eq!(
             selected(&policy, claims(), Some("deploy"), CLOUDFLARE_AUDIENCE),
-            err("profile deploy isn't for provider github")
+            err("scope deploy isn't for provider github")
         );
     }
 
@@ -2021,10 +2266,10 @@ pub(super) mod tests {
         claims.insert("repository_id".into(), "200000002".into());
         claims.insert("environment".into(), "prod".into());
         let (profile, policies) = policy
-            .profile_for(
+            .profiles_for(
                 "com.github.actions",
                 &claims,
-                Some("example-org/infra:ci.apply"),
+                &["example-org/infra:ci.apply"],
                 CLOUDFLARE_AUDIENCE,
             )
             .unwrap();
