@@ -20,7 +20,7 @@ jobs:
       id-token: write # required: lets the job request an OIDC token
     steps:
       - uses: actions/checkout@v6
-      - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+      - uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
         with:
           url: https://cloudflare-sts-api.example.com
           scopes: example-org/app:ci.deploy
@@ -34,7 +34,7 @@ It needs a deployed [broker](../crates/cloudflare-sts-api) whose policy allows t
 Pin a release. Before 1.0 there's no floating `v0` tag, because a minor release may contain breaking changes:
 
 ```yaml
-- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+- uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
 ```
 
 For the strictest setup, pin the commit SHA the tag points to, and let Dependabot's `github-actions` updates keep it current:
@@ -85,7 +85,7 @@ None of this can be switched off: what's exported is decided by the profile. Exp
 `wrangler-action` sets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from its own inputs. If you omit them it overwrites the exported values with empty strings, so pass them explicitly:
 
 ```yaml
-- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+- uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
     scopes: example-org/app:ci.deploy
@@ -98,7 +98,7 @@ None of this can be switched off: what's exported is decided by the profile. Exp
 ### Terraform / OpenTofu apply
 
 ```yaml
-- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+- uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
     scopes: example-org/infra:ci.apply
@@ -116,7 +116,7 @@ When the matched profile has an [`access`](../crates/cloudflare-sts-api#access-s
 | `CF_ACCESS_CLIENT_SECRET` | the client secret, masked  |
 
 ```yaml
-- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+- uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
     scopes: example-org/app:ci.nix
@@ -148,7 +148,7 @@ When the matched profile has a [`bucket`](../crates/cloudflare-sts-api#buckets),
 S3 tools read `AWS_*`, so map the credentials in the step that runs them:
 
 ```yaml
-- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+- uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
     scopes: example-org:terraform-state
@@ -169,7 +169,7 @@ S3 tools read `AWS_*`, so map the credentials in the step that runs them:
 List the profiles in `scopes`, one per line or separated by spaces. The workflow must be allowed every one, and the token gets what they grant together. At most one of them may have a bucket.
 
 ```yaml
-- uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+- uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
   with:
     url: https://cloudflare-sts-api.example.com
     scopes: |
@@ -187,7 +187,7 @@ jobs:
     permissions: { contents: read, id-token: write }
     steps:
       - uses: actions/checkout@v6
-      - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+      - uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
         with: { url: https://cloudflare-sts-api.example.com, scopes: example-org/app:ci.dns }
       - run: ./scripts/update-dns.sh
 
@@ -198,7 +198,7 @@ jobs:
     permissions: { contents: read, id-token: write }
     steps:
       - uses: actions/checkout@v6
-      - uses: cf-contrib/cloudflare-sts@v0.22.0 # x-release-please-version
+      - uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
         with: { url: https://cloudflare-sts-api.example.com, scopes: example-org/app:ci.deploy }
       - run: npx wrangler deploy
 ```

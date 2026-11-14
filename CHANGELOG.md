@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.23.0](https://github.com/cf-contrib/cloudflare-sts/compare/v0.22.0...v0.23.0) (2026-11-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* a provider's client_id (and the audience it filled in), and identity_providers in /.well-known/oauth-authorization-server, are removed. A cf-vault profile that names only the broker's issuer needs oauth2.issuer, oauth2.client_id and the exchange endpoints.
+* the `profile` request parameter, the `profile` response field and the action's `profile` input are replaced by `scope`.
+
+### Features
+
+* ask for profiles with a space-delimited scope, several at once ([#128](https://github.com/cf-contrib/cloudflare-sts/issues/128)) ([5d72ac3](https://github.com/cf-contrib/cloudflare-sts/commit/5d72ac3488201eff289b9b8af577798534d79232))
+* issue Cloudflare Access service tokens for an application ([#130](https://github.com/cf-contrib/cloudflare-sts/issues/130)) ([2eccef4](https://github.com/cf-contrib/cloudflare-sts/commit/2eccef437ad5a94b8cb4f04ffcc3ddbf91ba40f1))
+* keep the broker to STS: no sign-in discovery, no tokens of its own ([#131](https://github.com/cf-contrib/cloudflare-sts/issues/131)) ([ff00ad8](https://github.com/cf-contrib/cloudflare-sts/commit/ff00ad82353cd0fccbf3209077c988963e6efea1))
+
 ## [0.22.0](https://github.com/cf-contrib/cloudflare-sts/compare/v0.21.1...v0.22.0) (2026-11-13)
 
 
