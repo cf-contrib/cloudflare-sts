@@ -36,9 +36,9 @@ use cloudflare::v4::{
 };
 use cloudflare_sts_sdk::v1::{
     self, AccessCredentials, AuthorizationServerMetadata, BucketCredentials, DiscoveryServiceApi,
-    Error, ErrorCode, IdentityProvider, IssuedTokenType, Jwks, OpenIdProviderMetadata,
-    TokenExchangeRequest, TokenExchangeRequestSubjectTokenType as SubjectTokenType,
-    TokenExchangeResponse, TokenExchangeResponseTokenType as TokenType, TokenRevocationRequest,
+    Error, ErrorCode, IssuedTokenType, Jwks, OpenIdProviderMetadata, TokenExchangeRequest,
+    TokenExchangeRequestSubjectTokenType as SubjectTokenType, TokenExchangeResponse,
+    TokenExchangeResponseTokenType as TokenType, TokenRevocationRequest,
     TokenRevocationRequestTokenTypeHint, TokenServiceApi,
 };
 use serde_json::json;
@@ -825,17 +825,6 @@ impl DiscoveryServiceApi for DiscoveryServiceHandler {
             grant_types_supported: vec![TOKEN_EXCHANGE.into()],
             token_endpoint_auth_methods_supported: Some(vec!["none".into()]),
             revocation_endpoint_auth_methods_supported: Some(vec!["none".into()]),
-            identity_providers: Some(
-                policy
-                    .identity_providers()
-                    .map(|provider| IdentityProvider {
-                        name: provider.name.clone(),
-                        issuer: provider.issuer.clone(),
-                        client_id: provider.client_id.clone().unwrap_or_default(),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .filter(|providers| !providers.is_empty()),
         })
     }
 

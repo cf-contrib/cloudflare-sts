@@ -37,7 +37,7 @@ locals {
       issuer  = local.broker_url
       providers = [
         for provider in var.oidc_providers : {
-          for key, value in merge(provider, { audience = coalesce(provider.audience, provider.client_id, local.broker_url) }) :
+          for key, value in merge(provider, { audience = coalesce(provider.audience, local.broker_url) }) :
           key => value if value != null
         }
       ]

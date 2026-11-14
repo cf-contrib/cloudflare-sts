@@ -129,7 +129,7 @@ audience = "https://cloudflare-sts-api.example.com"
 [[providers]]
 name      = "com.cloudflare.access"                            # people, through an Access for SaaS OIDC application
 issuer    = "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client-id>"
-client_id = "<client-id>"                                      # people sign in as this client: see People
+audience  = "<client-id>"                                      # people's ID tokens' aud: the client they sign in as, see People
 
 # What each profile hands out. Who gets it is in policy.cedar.
 [[profiles]]
@@ -235,10 +235,9 @@ A provider is an OIDC issuer you trust to vouch for a caller. `providers` is a l
 |---|---|
 | `name` | Required, unique. Profiles name it in `provider`, and the Cedar policy in `Admit::Action::"<name>"`. |
 | `issuer` | Required. The tokens' `iss`, exactly. `https://`, or plain `http://` on `127.0.0.1`, `localhost` or `[::1]` for local development. One provider per issuer. |
-| `audience` | Required, unless there's a `client_id`. The tokens' `aud` must contain it. Use one only the broker accepts, such as its URL: for GitHub Actions, not GitHub's default `https://github.com/<owner>`, so a token requested for AWS or GCP can't be replayed here. |
+| `audience` | Required. The tokens' `aud` must contain it. Use one only the broker accepts, such as its URL: for GitHub Actions, not GitHub's default `https://github.com/<owner>`, so a token requested for AWS or GCP can't be replayed here. |
 | `jwks_uri` | Optional. Otherwise the keys come from the issuer's metadata: its `/.well-known/openid-configuration`, or, if it has none, its RFC 8414 `/.well-known/oauth-authorization-server`, which must name the same issuer. They never come from a URL in the token. |
 | `typ` | Optional. The `typ` its tokens must have ([RFC 8725 §3.11](https://www.rfc-editor.org/rfc/rfc8725#section-3.11)), such as `at+jwt` to take only another broker's access tokens, so another kind of token its issuer signs can't pass for one. Unset takes any. |
-| `client_id` | Optional. The OAuth client [people](#people) sign in to it as, for an ID token the broker takes: a provider with one is listed in the metadata. It's also the `audience`, which can then be left out. |
 
 `audience` is a field, not a claim, because it says whether the token is meant for the broker at all: it's checked with the signature, `iss` and expiry, before the Cedar policy sees the token. Either failing is `400` (`invalid_request`), as RFC 8693 has it for a subject token that's invalid or that the policy doesn't take.
 
@@ -273,7 +272,7 @@ Cedar wants an action's type to end in `Action`, hence the namespaces. The reque
 
 The broker takes OIDC tokens only. For people, use an identity provider that issues them an ID token, such as a [Cloudflare Access for SaaS](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/saas-apps/generic-oidc-saas/) OIDC application, as a public client with PKCE and the redirect `http://127.0.0.1:8250/callback`. A provider for it is like any other, and its profiles match on its tokens' claims, such as `email`. terraform-cloudflare-access's [`saas-oidc`](https://github.com/tf-contrib/terraform-cloudflare-access/tree/main/modules/saas-oidc) module creates the application and its policy, and the [Terraform module's README](../../deployment/terraform#people) shows the provider to give the broker.
 
-Give that provider the `client_id` people sign in as, and the broker's [metadata](#http-api) lists it in `identity_providers`, with its name and issuer. An ID token's `aud` is the client it was issued to, so the `client_id` is the provider's `audience` too: leave `audience` out, or set it to the same. Several providers can have one. [cf-vault](https://github.com/cf-contrib/cf-vault) reads the list, so the broker's URL and profile are all a person sets, with `provider = "<name>"` to pick one when there are several.
+An ID token's `aud` is the client it was issued to, so that client's ID is the provider's `audience`. The broker doesn't know how people sign in, and doesn't list providers: [cf-vault](https://github.com/cf-contrib/cf-vault) is told the issuer and client in the person's own profile (`oauth2.issuer`, `oauth2.client_id`), and the broker's endpoints (`oauth2.exchange.token_endpoint`, `revocation_endpoint`).
 
 Access's ID tokens carry `email`, `sub` and the application's `iss`, and last 5 minutes, whatever the application's access token lifetime ([#53](https://github.com/cf-contrib/cloudflare-sts/issues/53)). For a sign-in that lasts, give the application a refresh token lifetime (`saas-oidc`'s `refresh_token_lifetime`): cf-vault then renews the login without a browser. Access does not list `offline_access` in its metadata, so cf-vault has to ask for it: `scopes = ["openid", "email", "offline_access"]` in the profile.
 
@@ -457,7 +456,7 @@ These are enforced when the policy loads, so an unsafe policy never serves a req
 |---|---|---|---|
 | `POST` | `/oauth/token` | `subject_token` in the body | [Token exchange](#token-exchange) (RFC 8693) of an OIDC token. What the action uses. |
 | `POST` | `/oauth/revoke` | `token` in the body | [Revoke](#revocation) (RFC 7009) a token the broker minted. What the action's post step uses. |
-| `GET` | `/.well-known/oauth-authorization-server` | public | The broker's Authorization Server Metadata (RFC 8414): its issuer, key and endpoint URLs, for services that verify [its tokens](#tokens-for-other-services). Its endpoints' auth methods are `none`: callers don't authenticate as clients. With providers that have a `client_id`, also `identity_providers: [{ name, issuer, client_id }]`, where [people](#people) sign in. |
+| `GET` | `/.well-known/oauth-authorization-server` | public | The broker's Authorization Server Metadata (RFC 8414): its issuer, key and endpoint URLs, for services that verify [its tokens](#tokens-for-other-services). Its endpoints' auth methods are `none`: callers don't authenticate as clients. |
 | `GET` | `/.well-known/openid-configuration` | public | The same issuer and keys as OpenID Provider Metadata (OpenID Connect Discovery 1.0), for services that only read that. |
 | `GET` | `/.well-known/jwks` | public | The public key the broker signs its own tokens with. Empty without `CLOUDFLARE_STS_API_SIGNING_KEY`. |
 | `GET` | `/health/live` | public | `200` whenever the Worker's bindings are valid. |

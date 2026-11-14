@@ -251,13 +251,6 @@ components:
           items:
             type: string
           description: '`none`: holding the token is the proof.'
-        identity_providers:
-          type: array
-          items:
-            $ref: '#/components/schemas/IdentityProvider'
-          description: |-
-            The broker's own extension: the providers people sign in with for a subject token,
-            those the policy gives a `client_id`. Left out when there are none. Not secret.
       description: Authorization Server Metadata (RFC 8414 §2).
     BucketCredentials:
       type: object
@@ -314,25 +307,6 @@ components:
       description: |-
         RFC 6749's error codes (§5.2, and §4.1.2.1 for the broker's own faults) and RFC
         8693's `invalid_target`.
-    IdentityProvider:
-      type: object
-      required:
-        - name
-        - issuer
-        - client_id
-      properties:
-        name:
-          type: string
-          description: The policy's name for it, which a client picks it by.
-        issuer:
-          type: string
-          description: Its issuer. Its OpenID Connect Discovery document has the endpoints.
-        client_id:
-          type: string
-          description: "The client to sign in as: its ID tokens' `aud`."
-      description: |-
-        An OpenID Provider people sign in with as a public client, with PKCE, for an ID token
-        the broker takes.
     IssuedTokenType:
       type: string
       enum:

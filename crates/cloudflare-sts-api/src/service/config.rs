@@ -375,9 +375,6 @@ impl PolicyConfig {
         }
         check_origin(&self.issuer).map_err(|why| format!("issuer {why}"))?;
 
-        for (index, provider) in self.providers.iter_mut().enumerate() {
-            provider.resolve(&format!("providers[{index}]"))?;
-        }
         self.providers.check("providers")?;
         for (index, provider) in self.providers.iter().enumerate() {
             let at = format!("providers[{index}]");
@@ -407,13 +404,6 @@ impl PolicyConfig {
             profile.check(&at, &self.issuer, account_id)?;
         }
         Ok(())
-    }
-
-    /// The providers people sign in with: those with a `client_id`.
-    pub fn identity_providers(&self) -> impl Iterator<Item = &ProviderConfig> {
-        self.providers
-            .iter()
-            .filter(|provider| provider.client_id.is_some())
     }
 
     /// The provider a token's claims say it comes from, by its `iss`.
@@ -560,7 +550,8 @@ pub struct ProviderConfig {
     pub name: String,
     /// Matched exactly against a token's `iss`.
     pub issuer: String,
-    /// A value the token's `aud` must have: its `client_id` if left out.
+    /// A value the token's `aud` must have: for an ID token people sign in
+    /// for, the client it was issued to.
     #[serde(default)]
     pub audience: String,
     /// Where its keys are. `None` means its metadata says.
@@ -571,11 +562,6 @@ pub struct ProviderConfig {
     /// signs can't pass for one. `None` takes any.
     #[serde(default)]
     pub typ: Option<String>,
-    /// The OAuth client people sign in to it as, for an ID token whose `aud`
-    /// is this client: the metadata tells clients such as cf-vault. `None` for
-    /// a provider only machines get tokens from, such as GitHub Actions.
-    #[serde(default)]
-    pub client_id: Option<String>,
 }
 
 /// What the auth layer verifies a token from it against.
@@ -598,27 +584,6 @@ impl Provider for ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// Fills in the audience from the client ID when it's left out, before
-    /// the providers are checked.
-    fn resolve(&mut self, at: &str) -> Result<(), String> {
-        let Some(client_id) = &self.client_id else {
-            return Ok(());
-        };
-        if client_id.is_empty() {
-            return Err(format!("{at}.client_id must not be empty"));
-        }
-        // An ID token's aud is the client it was issued to: another audience
-        // would refuse every token people sign in for.
-        if self.audience.is_empty() {
-            self.audience = client_id.clone();
-        } else if self.audience != *client_id {
-            return Err(format!(
-                "{at}.audience must be its client_id, {client_id}, or left out"
-            ));
-        }
-        Ok(())
-    }
-
     fn check(&self, at: &str) -> Result<(), String> {
         // Its issuer, jwks_uri and audience are the providers' check.
         check_provider_name(&self.name).map_err(|why| format!("{at}.name {why}"))?;
@@ -1539,26 +1504,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn names_the_providers_people_sign_in_with_by_their_client_id() {
-        assert_eq!(parse(&policy()).identity_providers().count(), 0);
-
-        let mut both = policy();
-        both["providers"].as_array_mut().unwrap().extend([
-            json!({ "name": "access", "issuer": "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc", "client_id": "abc"  }),
-            json!({ "name": "okta", "issuer": "https://example.okta.com", "audience": "0oa1", "client_id": "0oa1"  }),
-        ]);
-        both["profiles"][0]["provider"] = json!("github");
-        both["profiles"][1]["provider"] = json!("github");
-        let policy = parse(&both);
-        let people: Vec<(&str, &str)> = policy
-            .identity_providers()
-            .map(|p| (p.name.as_str(), p.audience.as_str()))
-            .collect();
-        // The audience is the client ID, whether it's said or not.
-        assert_eq!(people, [("access", "abc"), ("okta", "0oa1")]);
-    }
-
-    #[test]
     fn parses_durations() {
         for (value, ms) in [
             ("90s", 90 * SECOND),
@@ -1680,22 +1625,6 @@ pub(super) mod tests {
         for (policy, expected) in cases {
             let err = parse_err(&policy);
             assert!(err.contains(expected), "{expected}: {err}");
-        }
-
-        for (field, value, expected) in [
-            (
-                "client_id",
-                json!(""),
-                "providers[0].client_id must not be empty",
-            ),
-            (
-                "client_id",
-                json!("abc"),
-                "providers[0].audience must be its client_id, abc, or left out",
-            ),
-        ] {
-            let err = parse_err(&with(&format!("/providers/0/{field}"), value));
-            assert_eq!(err, expected);
         }
     }
 

@@ -747,15 +747,13 @@ mod people {
     }
 
     #[tokio::test]
-    async fn the_metadata_says_where_people_sign_in() {
+    async fn the_metadata_names_no_identity_providers() {
         let _t = start().await;
         let res = call(Method::GET, "/.well-known/oauth-authorization-server").await;
         assert_eq!(res.status, 200);
-        // Only the providers with a client ID: not GitHub Actions or GitLab.
-        assert_eq!(
-            res.json()["identity_providers"],
-            json!([{ "name": "access", "issuer": issuer("access"), "client_id": CLIENT_ID }])
-        );
+        // Sign-in is the client's: cf-vault is told the provider and client
+        // in its own profile, so the broker has none to list.
+        assert!(res.json().get("identity_providers").is_none());
     }
 
     #[tokio::test]

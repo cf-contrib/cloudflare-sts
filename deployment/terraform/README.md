@@ -242,9 +242,9 @@ module "cloudflare_sts_api" {
   oidc_providers = [
     # ... CI's providers
     {
-      name      = "com.cloudflare.access"
-      issuer    = module.cloudflare_access_saas_oidc.issuer
-      client_id = module.cloudflare_access_saas_oidc.client_id # people's ID tokens' audience
+      name     = "com.cloudflare.access"
+      issuer   = module.cloudflare_access_saas_oidc.issuer
+      audience = module.cloudflare_access_saas_oidc.client_id # people's ID tokens' audience: the client they sign in as
     },
   ]
 
@@ -271,12 +271,16 @@ type = "oauth2"
 account_id = "<account id>"
 
 [people.oauth2]
+# Where to sign in: the same issuer as the broker's provider, and the client.
+issuer    = "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/<client id>"
+client_id = "<client id>"
 # Access accepts offline_access (a refresh token) but does not list it
 scopes = ["openid", "email", "offline_access"]
 
 [people.oauth2.exchange]
-url = "https://cloudflare-sts-api.example.com"
-profile = "infra-admins:tofu-plan"
+token_endpoint      = "https://cloudflare-sts-api.example.com/oauth/token"
+revocation_endpoint = "https://cloudflare-sts-api.example.com/oauth/revoke"
+scopes              = ["infra-admins:tofu-plan"]
 ```
 
 ```sh
@@ -345,7 +349,7 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
 | `zone_id` | for a custom domain | `null` | Zone ID of the zone holding a custom-domain `hostname`. |
 | `cloudflare_token_secret` | yes | | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the Cloudflare token. With a profile's `bucket`, the token also needs R2 permissions covering what it delegates. |
 | `signing_key_secret` | for profiles with an `audience` | `null` | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the RSA key the broker signs its own tokens with. See [Tokens for other services](../../crates/cloudflare-sts-api#tokens-for-other-services). |
-| `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ?, client_id? }` each. `audience` defaults to the `client_id` [people](../../crates/cloudflare-sts-api#people) sign in as, if there is one, and otherwise to the broker's URL. See [Policy](#policy). |
+| `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ? }` each. `audience` defaults to the broker's URL; for [people](../../crates/cloudflare-sts-api#people) it is the client they sign in as. See [Policy](#policy). |
 | `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `access`, `audience`. See [Policy](#policy). |
 | `cedar_policy` | yes | | Who gets what: Cedar text with a permit for `Admit::Action::"<provider>"` for every provider, pinning your org, and `Profile::Action::"<name>"` for every profile, each with an `@id`. See [Policy](#policy). |
 | `defaults` | no | `{}` | `{ ttl?, max_ttl? }`: the TTLs of profiles that don't set their own. |

@@ -35,7 +35,7 @@ typ = "at+jwt"
 [[providers]]
 name = "access"
 issuer = "http://127.0.0.1:8791/issuers/access"
-client_id = "test-access-client-id"
+audience = "test-access-client-id"
 
 [[profiles]]
 name = "example-org/infra:ci.apply"
