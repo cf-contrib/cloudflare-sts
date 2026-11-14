@@ -43,7 +43,7 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
 
 ## Deploy
 
-1. **Create the Cloudflare token.** In the Cloudflare dashboard, create an **account-owned** API token with **Account API Tokens Write**. If any profile has a [`bucket`](#buckets), also give it R2 permissions covering what the buckets delegate. It's the broker's only long-lived credential. This is the one manual step: automating it would need a token that can create tokens. Store it in [Secrets Store](https://developers.cloudflare.com/secrets-store/) so it never passes through your deploy tooling:
+1. **Create the Cloudflare token.** In the Cloudflare dashboard, create an **account-owned** API token with **Account API Tokens Write**. If any profile has a [`bucket`](#buckets), also give it R2 permissions covering what the buckets delegate, and **Access: Service Tokens Write** if any has an [`access`](#access-service-tokens). It's the broker's only long-lived credential. This is the one manual step: automating it would need a token that can create tokens. Store it in [Secrets Store](https://developers.cloudflare.com/secrets-store/) so it never passes through your deploy tooling:
    ```sh
    wrangler secrets-store secret create <store-id> --name cloudflare-sts-cloudflare-token --scopes workers --remote
    ```
@@ -64,7 +64,7 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
 |---|---|---|---|
 | `CLOUDFLARE_STS_API_ACCOUNT_ID` | plain text | yes | Account the Cloudflare token belongs to and tokens are minted in. |
 | `CLOUDFLARE_STS_API_POLICY_KV` | Workers KV namespace | yes | Holds the [policy](#policy) under two keys: `config`, the TOML (or JSON), and `policy`, the Cedar. No size limit to speak of (a Worker variable held 5 KB). Each isolate keeps the policy it read for a minute. |
-| `CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN` | Secrets Store secret | yes | Account-owned token with Account API Tokens Write, plus R2 permissions covering what profiles' buckets delegate. Read on every request, so rotating the secret takes effect without a redeploy. Anything else, such as a plain `wrangler secret`, is refused with `500`. |
+| `CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN` | Secrets Store secret | yes | Account-owned token with Account API Tokens Write, plus R2 permissions covering what profiles' buckets delegate, plus Access: Service Tokens Write for profiles with an `access`. Read on every request, so rotating the secret takes effect without a redeploy. Anything else, such as a plain `wrangler secret`, is refused with `500`. |
 | `CLOUDFLARE_STS_API_SIGNING_KEY` | Secrets Store secret | for profiles with an `audience` | RSA private key (at least 2048 bits), as a PKCS#8 PEM, the broker signs [its own tokens](#tokens-for-other-services) with. Without it the broker issues none, publishes no keys, and those profiles fail closed with `500`. Bound as anything else, it's refused with `500`, as the Cloudflare token is. |
 
 The hourly cron (`17 * * * *` in the examples) deletes expired `cloudflare-sts:*` tokens.
@@ -221,7 +221,7 @@ permit (principal, action == Profile::Action::"infra-admins:tofu-plan", resource
 when { ["alice@example.com", "bob@example.com"].contains(context.email) };
 ```
 
-A profile has a `token`, a `bucket`, or both, for callers with a token from its `provider`. A profile with an `audience` instead issues the broker's own token for that service: see [Tokens for other services](#tokens-for-other-services).
+A profile has a `token`, a `bucket`, an `access` (an [Access service token](#access-service-tokens)), or a mix, for callers with a token from its `provider`. A profile with an `audience` instead issues the broker's own token for that service: see [Tokens for other services](#tokens-for-other-services).
 
 To switch a profile off, for example during an incident, set `enabled = false`. It stays in the policy but never matches, and a request naming it is refused (`invalid_request`). Remember [how long a change takes](#bindings).
 
@@ -342,6 +342,28 @@ A profile's `bucket` gets the job [temporary R2 credentials](https://developers.
 
 **What `bucket` doesn't cover:** admin operations such as creating or listing buckets. For those, grant R2 permissions in the profile's `token` and derive S3 credentials from `CLOUDFLARE_API_TOKEN` in a step: the access key ID is the token's ID, and the secret is the SHA-256 of the token value. Buckets in a jurisdiction (`eu`, `fedramp`) need a different endpoint than the one the broker returns.
 
+### Access service tokens
+
+A profile's `access` gets the job a [Cloudflare Access service token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) for an application, so CI can call a self-hosted app behind Access without a long-lived secret in GitHub:
+
+```toml
+[[profiles]]
+name     = "example-org/app:ci.nix"
+provider = "github"
+access   = { audience = "https://nix.example.com" }
+```
+
+The job gets a client ID and secret, which it sends as the `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers. The action exports them as `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`, waits until Access honors them, and revokes the token when the job ends.
+
+- **Tagged with the application.** The broker creates the token with the tag `cloudflare-sts-audience` set to the `audience`'s host (`nix.example.com`). An Access policy admits it with a `service_token_tag` rule for that key and value, a Service Auth (`non_identity`) policy, which admits this application's tokens and no other's. Without such a rule the token gets nowhere: the broker doesn't touch your Access policies.
+- **At least 10 minutes.** Cloudflare refuses a shorter service token, so the token lasts the profile's `ttl`, or 10 minutes if that's shorter. The job's last step revokes it; the hourly cleanup deletes the ones that lapsed.
+- **A few seconds to take effect.** Cloudflare's edge takes 1 to 3 seconds to honor a new token. The action waits (at most 15 seconds) by asking the application until it stops answering `302` or `403`; a job that calls the application itself should retry briefly.
+- **One application per grant,** so the action always exports it under the same names. A request for several scopes may name at most one profile with an `access`.
+- **With a `token` or a `bucket`,** the broker creates those first. If the service token then can't be created, it deletes the API token and replies `503`.
+- **Revoked by ID.** `POST /oauth/revoke` with `token_type_hint=urn:cloudflare-sts:params:oauth:token-type:access_service_token` and the `access.token_id` as `token`. Cloudflare can't say a service token's secret is right, so the ID, which only the job was given, is the proof. It deletes only tokens named `cloudflare-sts:*`.
+- **Parent token:** the Cloudflare token needs **Access: Service Tokens Write**. That doesn't widen what a leaked Cloudflare token can do: with Account API Tokens Write it could already mint itself anything.
+- **What it doesn't do:** Access can't tell reads from writes, so a token admits its application whole. And a rule that admits *any* valid service token (rather than this tag) would admit every token in the account, whoever made it.
+
 ### Tokens for other services
 
 A profile with `audience: <service URL>` gives the caller a token the broker signs itself, for another service that trusts the broker, such as [cloudflare-nix](https://github.com/cf-contrib/cloudflare-nix). It has no `token` or `bucket`: who may use the service is decided by the Cedar policy, like any other.
@@ -383,7 +405,7 @@ Its `kid` is the public key's thumbprint, so replacing the secret rotates the ke
 ### TTL and names
 
 - Durations look like `90s`, `15m`, `1h`, `1h30m`: each unit once, largest first.
-- `ttl` and `max_ttl` go on the profile, and apply to its token and bucket alike.
+- `ttl` and `max_ttl` go on the profile, and apply to its token, bucket and access alike. An Access service token lasts at least 10 minutes, whatever they say.
 - A requested `ttl` above the profile's `max_ttl` is clamped. Below `1m`, or unparseable, is a `400`. In the policy, a `ttl` below `1m` is refused when it loads.
 - Provider names are 1–64 characters of `A-Z`, `a-z`, `0-9`, `_`, `.` and `-`, starting with a letter or digit, and unique. They go into minted tokens' names, which `:` separates, and into `client_id`.
 - Profile names are 1–255 characters of `A-Z`, `a-z`, `0-9`, `_`, `.`, `:`, `/` and `-`, starting with a letter or digit, and unique, so a name can say whose the profile is: `example-org/app:ci.deploy`. See [Naming](#naming).
@@ -479,7 +501,8 @@ The response has the standard fields plus the broker's own:
   "token_id": "…",
   "account_id": "0123456789abcdef0123456789abcdef",
   "scope": "example-org:workers-deploy",
-  "bucket": { "name": "…", "access_key_id": "…", "secret_access_key": "…", "session_token": "…", "prefixes": ["…"], "endpoint": "…", "expires_on": "…" }
+  "bucket": { "name": "…", "access_key_id": "…", "secret_access_key": "…", "session_token": "…", "prefixes": ["…"], "endpoint": "…", "expires_on": "…" },
+  "access": { "token_id": "…", "client_id": "…", "client_secret": "…", "audience": "https://nix.example.com", "expires_on": "…" }
 }
 ```
 
@@ -487,7 +510,7 @@ The response has the standard fields plus the broker's own:
 
 `requested_token_type` doesn't choose what's issued: the profile does. It only refuses a type the audience can't have (`invalid_target`), so a profile with a `token` and a `bucket` answers `access_token` even if `r2_credentials` was asked for.
 
-`bucket` is there when the profile has one. A profile with only a bucket has no bearer token, so it returns no `access_token` or `token_id`, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:r2_credentials` and `token_type` `N_A`. For a service's audience, `access_token` is the broker's JWT access token, `issued_token_type` is `urn:ietf:params:oauth:token-type:access_token` (or `…:jwt`, if that's what `requested_token_type` asked for), and there's no `token_id`, `account_id` or `bucket`.
+`bucket` is there when the profile has one, and `access` when it has an `access`. A profile with only an access has no bearer token either, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:access_service_token` and `token_type` `N_A`. A profile with only a bucket has no bearer token, so it returns no `access_token` or `token_id`, with `issued_token_type` `urn:cloudflare-sts:params:oauth:token-type:r2_credentials` and `token_type` `N_A`. For a service's audience, `access_token` is the broker's JWT access token, `issued_token_type` is `urn:ietf:params:oauth:token-type:access_token` (or `…:jwt`, if that's what `requested_token_type` asked for), and there's no `token_id`, `account_id` or `bucket`.
 
 Errors are the same as on every route.
 
@@ -499,6 +522,7 @@ Profiles for Cloudflare's audience are combined into one grant:
 
 - **Token:** their `token.policies` together, as one token, so it can do what each of them could.
 - **Bucket:** at most one of them may have a `bucket`, because the credentials are for one bucket. Two is `invalid_scope`.
+- **Access:** at most one of them may have an `access`, because a service token is for one application. Two is `invalid_scope`.
 - **Lifetime:** the shortest `ttl` and the shortest `max_ttl` among them, so nothing outlives what any of them allows.
 
 A profile for another service's audience gives the broker's own token with that profile's claims, so a request for it takes exactly one scope.
@@ -513,7 +537,7 @@ curl -sS https://cloudflare-sts-api.example.com/oauth/token \
 
 ### Revocation
 
-`POST /oauth/revoke` is an [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) revocation, form-encoded, with the token in `token` (`token_type_hint`, if sent, must be `access_token`, and is otherwise ignored). Holding the token is the proof. It answers `200` with no body whether the token was revoked, was already gone, was never valid, or isn't one the broker minted (one not named `cloudflare-sts:*`, including the Cloudflare token), which it never deletes: to the broker that's an invalid token, which RFC 7009 answers with `200` too. The audit log says which (`token.revoke`, `reason: not_minted`).
+`POST /oauth/revoke` is an [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) revocation, form-encoded, with the token in `token` (`token_type_hint`, if sent, is `access_token`, and is otherwise ignored; or `urn:cloudflare-sts:params:oauth:token-type:access_service_token`, with the service token's ID as `token`, see [Access service tokens](#access-service-tokens)). Holding the token is the proof. It answers `200` with no body whether the token was revoked, was already gone, was never valid, or isn't one the broker minted (one not named `cloudflare-sts:*`, including the Cloudflare token), which it never deletes: to the broker that's an invalid token, which RFC 7009 answers with `200` too. The audit log says which (`token.revoke`, `reason: not_minted`).
 
 ```sh
 curl -sS https://cloudflare-sts-api.example.com/oauth/revoke -d token="$CLOUDFLARE_API_TOKEN"
@@ -541,6 +565,7 @@ For the caller's own mistakes (400) the description says what was wrong, for exa
 | Deleted repo or org re-registered by an attacker | Pin numeric IDs, not names |
 | Malicious PR code gets a prod token | Require `ref == "refs/heads/main"` and `environment == "prod"`, with required reviewers on the environment. Fork PRs don't get `id-token: write` on `pull_request`. Add a `forbid` for `event_name == "pull_request_target"`, once, for every profile. |
 | Stolen minted token | 15m default TTL, revoked at job end, expired tokens deleted hourly |
+| Stolen Access service token | Valid for one application (its tag), at least 10 minutes and at most the profile's `ttl`, revoked at job end, and expired ones deleted hourly. It admits its application whole: Access can't tell reads from writes |
 | Stolen R2 credentials | Limited to one bucket and the repo's prefixes, and short-lived. They can't be revoked one by one; rolling the Cloudflare token revokes all of them |
 | One repo reaches another's R2 keys | Prefixes must end in `/`, placeholders fill whole segments from verified claims with a fixed character set, and both the template and the result are checked. Prefer ID-based prefixes |
 | Stolen JWT replayed | Short JWT lifetime and a custom audience |
@@ -564,6 +589,12 @@ R2 credentials are `r2.issued`, with the bucket, the filled-in prefixes and the 
 
 ```json
 {"level":"INFO","event":"r2.issued","provider":"com.github.actions","profile":"example-org:terraform-state","sub":"repo:example-org/app:ref:refs/heads/main","claims":"{\"ref\":\"refs/heads/main\",\"repository_owner_id\":\"100000001\"}","bucket":"org-terraform-state","prefixes":"[\"100000001/200000003/\"]","permission":"object-read-write","expires_at":1790961140}
+```
+
+An Access service token is `access.issued`, with the application and the token's ID, never its secret:
+
+```json
+{"level":"INFO","event":"access.issued","provider":"com.github.actions","profile":"example-org/app:ci.nix","sub":"repo:example-org/app:ref:refs/heads/main","claims":"{\"ref\":\"refs/heads/main\"}","audience":"https://nix.example.com","token_id":"<uuid>","expires_at":1790961140}
 ```
 
 A token for another service is `token.issue`, with the audience and the token's `jti`, never the token:
@@ -604,6 +635,7 @@ The other events:
 - **Resource IDs aren't checked up front.** Apart from the account check, a wrong zone ID is only caught when Cloudflare rejects the mint (`503`).
 - **Permission names can change.** Cloudflare can rename a permission group. Profiles using the old name fail closed (`500`) until the policy is updated.
 - **Secrets Store is required, and in open beta.** The Cloudflare token is only accepted from Secrets Store, so a plain Worker secret can't end up in Terraform state or deploy tooling. Accounts without Secrets Store can't run the broker yet.
+- **Access service tokens last at least 10 minutes,** and a job that dies before its last step leaves its token valid until then. One application per grant, and Access can't scope a token to reads.
 - **R2 credentials can't be revoked early.** They last their TTL; only rolling the Cloudflare token cuts them all off. One bucket per grant, and only buckets outside a jurisdiction.
 - **No rate limit.** A workflow the policy allows can mint as often as it runs. Each token expires within minutes, is revoked at job end and cleaned up hourly, but a compromised workflow could still create many tokens at once. Cloudflare's rate-limit binding was tried and didn't enforce a 30-per-minute limit against ~85 requests a minute, so it was left out. An exact per-repository limit (e.g. a Durable Object) may come later.
 

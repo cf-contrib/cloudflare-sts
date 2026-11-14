@@ -9,6 +9,8 @@ import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   REQUEST_TOKEN,
+  STUB_ACCESS,
+  STUB_ACCESS_PROFILE,
   STUB_ACCOUNT_ID,
   STUB_BUCKET,
   STUB_R2_PROFILE,
@@ -179,6 +181,46 @@ describe("main", () => {
     }
   });
 
+  it("exports an Access service token once Access honors it, and no API token", async () => {
+    stub = await startStub({ accessRefusals: 2 });
+    const r = await action("main.js", {
+      ...oidcEnv(stub.url),
+      INPUT_URL: stub.url,
+      INPUT_SCOPES: STUB_ACCESS_PROFILE,
+    });
+
+    expect(r.code).toBe(0);
+    expect(r.env).toEqual({
+      CLOUDFLARE_ACCOUNT_ID: STUB_ACCOUNT_ID,
+      CF_ACCESS_CLIENT_ID: STUB_ACCESS.client_id,
+      CF_ACCESS_CLIENT_SECRET: STUB_ACCESS.client_secret,
+    });
+    expect(r.state).toEqual({ access_token_id: STUB_ACCESS.token_id });
+    expect(r.stdout).toContain(
+      `cloudflare-sts: issued an Access service token for ${stub.url} (scope smoke-access, expires 2026-09-28T12:15:00Z)`,
+    );
+    // It asked the application until it was admitted: two refusals, then the third.
+    expect(stub.calls.filter((c) => c.method === "GET" && c.path === "/")).toHaveLength(3);
+    expect(r.stdout).not.toContain("::warning::");
+    // The secret only ever appears in the mask command.
+    const out = r.stdout.split("\n");
+    expect(out.filter((l) => l.includes(STUB_ACCESS.client_secret))).toEqual([
+      `::add-mask::${STUB_ACCESS.client_secret}`,
+    ]);
+  });
+
+  it("refuses a response whose access is missing a field", async () => {
+    stub = await startStub({ tokenFields: { access: { ...STUB_ACCESS, client_secret: undefined, audience: "x" } } });
+    const r = await action("main.js", {
+      ...oidcEnv(stub.url),
+      INPUT_URL: stub.url,
+      INPUT_SCOPES: STUB_ACCESS_PROFILE,
+    });
+    expect(r.code).toBe(1);
+    expect(r.stdout).toContain("missing access.client_secret");
+    expect(r.env).toEqual({});
+  });
+
   it("exports both for a profile with a token and a bucket", async () => {
     stub = await startStub({ tokenFields: { bucket: STUB_BUCKET } });
     const r = await action("main.js", { ...oidcEnv(stub.url), INPUT_URL: stub.url });
@@ -224,7 +266,7 @@ describe("main", () => {
     ["token_id", { token_id: undefined }],
     ["expires_at", { expires_at: undefined }],
     ["account_id", { account_id: undefined }],
-    ["token and bucket", { access_token: undefined, token_id: undefined }],
+    ["token, bucket and access", { access_token: undefined, token_id: undefined }],
     ["bucket.name", { bucket: { ...STUB_BUCKET, name: undefined } }],
     ["bucket.session_token", { bucket: { ...STUB_BUCKET, session_token: undefined } }],
     ["bucket.secret_access_key", { bucket: { ...STUB_BUCKET, secret_access_key: "" } }],
@@ -301,6 +343,35 @@ describe("post", () => {
         body: { token: STUB_TOKEN, token_type_hint: "access_token" },
       },
     ]);
+  });
+
+  it("revokes the Access service token by its ID", async () => {
+    stub = await startStub();
+    const r = await action("post.js", {
+      INPUT_URL: stub.url,
+      STATE_access_token_id: STUB_ACCESS.token_id,
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain(`cloudflare-sts: revoked Access service token ${STUB_ACCESS.token_id}`);
+    expect(stub.calls).toEqual([
+      {
+        method: "POST",
+        path: "/oauth/revoke",
+        authorization: undefined,
+        body: {
+          token: STUB_ACCESS.token_id,
+          token_type_hint: "urn:cloudflare-sts:params:oauth:token-type:access_service_token",
+        },
+      },
+    ]);
+  });
+
+  it("warns instead of failing when revoking the Access service token fails", async () => {
+    stub = await startStub({ revokeStatus: 503 });
+    const r = await action("post.js", { INPUT_URL: stub.url, STATE_access_token_id: STUB_ACCESS.token_id });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain("::warning::cloudflare-sts: revoking Access service token");
+    expect(r.stdout).toContain("returned 503; it expires on its own");
   });
 
   it("only logs when the R2 credentials expire for a profile with only a bucket", async () => {

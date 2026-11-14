@@ -66,7 +66,7 @@ sequenceDiagram
     Note over Broker,CF: an hourly cron deletes expired cloudflare-sts:* tokens
 ```
 
-The only long-lived credential is the broker's **Cloudflare token**: an account-owned token with **Account API Tokens Write**, plus R2 permissions if profiles hand out [prefix-limited R2 credentials](crates/cloudflare-sts-api#buckets) (e.g. one shared Terraform-state bucket, each repo limited to its own prefix). It lives in Cloudflare Secrets Store, bound to the Worker, so it never passes through Terraform or CI and never leaves the Worker.
+The only long-lived credential is the broker's **Cloudflare token**: an account-owned token with **Account API Tokens Write**, plus R2 permissions if profiles hand out [prefix-limited R2 credentials](crates/cloudflare-sts-api#buckets), and **Access: Service Tokens Write** if they hand out [Access service tokens](crates/cloudflare-sts-api#access-service-tokens) (e.g. one shared Terraform-state bucket, each repo limited to its own prefix). It lives in Cloudflare Secrets Store, bound to the Worker, so it never passes through Terraform or CI and never leaves the Worker.
 
 ## Do you need it?
 

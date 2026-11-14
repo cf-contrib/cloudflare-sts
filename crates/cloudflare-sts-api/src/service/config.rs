@@ -241,6 +241,33 @@ impl CloudflareConfig {
         Ok(self.client_as(&token))
     }
 
+    /// One call to the API as the Cloudflare token, for what the generated
+    /// client can't say. Returns the status and the JSON body, which isn't
+    /// parsed on a non-JSON error page.
+    pub(super) async fn call(
+        &self,
+        method: worker::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> worker::Result<(u16, Value)> {
+        let token = self.token.read().await?;
+        let headers = worker::Headers::new();
+        headers.set("authorization", &format!("Bearer {token}"))?;
+        headers.set("accept", "application/json")?;
+        let mut init = worker::RequestInit::new();
+        init.with_method(method);
+        if let Some(body) = body {
+            headers.set("content-type", "application/json")?;
+            init.with_body(Some(JsValue::from_str(&body.to_string())));
+        }
+        init.with_headers(headers);
+        let request = worker::Request::new_with_init(&format!("{}{path}", self.url), &init)?;
+        let mut response = worker::Fetch::Request(request).send().await?;
+        let status = response.status_code();
+        let text = response.text().await.unwrap_or_default();
+        Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    }
+
     /// The API, as `token`: one a caller presents, say.
     pub fn client_as(&self, token: &str) -> HttpClient {
         HttpClient::new()
@@ -647,6 +674,9 @@ pub struct ProfileConfig {
     /// The bucket its caller gets R2 credentials for. One per profile, so the
     /// action always exports them under the same names.
     pub bucket: Option<BucketConfig>,
+    /// The Access application its caller gets a service token for. One per
+    /// profile, so the action always exports it under the same names.
+    pub access: Option<AccessConfig>,
 }
 
 impl ProfileConfig {
@@ -761,6 +791,17 @@ impl ProfileConfig {
                 with_bucket.join(", ")
             ));
         }
+        let with_access: Vec<&str> = profiles
+            .iter()
+            .filter(|p| p.access.is_some())
+            .map(|p| p.name.as_str())
+            .collect();
+        if with_access.len() > 1 {
+            return Err(format!(
+                "scopes {} each have an access, and a service token is for one application: ask for one of them",
+                with_access.join(", ")
+            ));
+        }
         let mut forward_claims: Vec<String> = Vec::new();
         for claim in profiles.iter().flat_map(|p| &p.forward_claims) {
             if !forward_claims.contains(claim) {
@@ -786,6 +827,7 @@ impl ProfileConfig {
                 .unwrap_or(first.max_ttl),
             token: (!policies.is_empty()).then_some(TokenConfig { policies }),
             bucket: profiles.iter().find_map(|p| p.bucket.clone()),
+            access: profiles.iter().find_map(|p| p.access.clone()),
         })
     }
 
@@ -797,10 +839,12 @@ impl ProfileConfig {
         // Guardrail 5: audiences are kept apart. The broker signs its own
         // token for another service; Cloudflare credentials are another
         // profile's job.
-        let credentials = self.token.is_some() || self.bucket.is_some();
+        let credentials = self.token.is_some() || self.bucket.is_some() || self.access.is_some();
         if self.audience == CLOUDFLARE_AUDIENCE {
             if !credentials {
-                return Err(format!("{at} must have a token, a bucket or both"));
+                return Err(format!(
+                    "{at} must have a token, a bucket, an access, or a mix"
+                ));
             }
         } else {
             check_origin(&self.audience).map_err(|why| format!("{at}.audience {why}"))?;
@@ -811,7 +855,7 @@ impl ProfileConfig {
             }
             if credentials {
                 return Err(format!(
-                    "{at}: a profile for {} can't have a token or a bucket",
+                    "{at}: a profile for {} can't have a token, a bucket or an access",
                     self.audience
                 ));
             }
@@ -822,6 +866,9 @@ impl ProfileConfig {
         }
         if let Some(bucket) = &self.bucket {
             bucket.check(&format!("{at}.bucket"))?;
+        }
+        if let Some(access) = &self.access {
+            access.check(&format!("{at}.access"), issuer)?;
         }
 
         // Guardrail 4: TTLs are capped, well within the 7 days R2 credentials
@@ -1051,6 +1098,40 @@ pub enum Effect {
 pub enum ResourceValue {
     Flat(String),
     Nested(BTreeMap<String, String>),
+}
+
+/// The Cloudflare Access application a profile's caller gets a service token
+/// for. The token is tagged with the application's host, which is what an
+/// Access policy of `service_token_tag` matches, so it admits this
+/// application and no other.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessConfig {
+    /// The application's origin, such as `https://nix.example.com`.
+    pub audience: String,
+}
+
+impl AccessConfig {
+    /// The tag every service token for this application carries: a
+    /// `service_token_tag` rule with this key and `host()` admits it.
+    pub const TAG: &'static str = "cloudflare-sts-audience";
+
+    /// The application's host, which a token's tag holds.
+    pub fn host(&self) -> &str {
+        self.audience
+            .split_once("://")
+            .map_or(self.audience.as_str(), |(_, host)| host)
+    }
+
+    fn check(&self, at: &str, issuer: &str) -> Result<(), String> {
+        check_origin(&self.audience).map_err(|why| format!("{at}.audience {why}"))?;
+        if self.audience == issuer {
+            return Err(format!(
+                "{at}.audience must be another service, not the broker"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A bucket a profile's caller gets R2 credentials for.
@@ -1725,11 +1806,11 @@ pub(super) mod tests {
         let cases = [
             (
                 json!({ "name": "nothing"  }),
-                "profiles[2] must have a token, a bucket or both",
+                "profiles[2] must have a token, a bucket, an access, or a mix",
             ),
             (
                 json!({ "name": "both", "audience": CACHE , "token": token() }),
-                "a profile for https://cloudflare-nix-api.example.com can't have a token or a bucket",
+                "a profile for https://cloudflare-nix-api.example.com can't have a token, a bucket or an access",
             ),
             (
                 json!({ "name": "self", "audience": BROKER  }),
@@ -2051,6 +2132,63 @@ pub(super) mod tests {
         assert_eq!(
             scoped(&policy, claims(), &["nix-push"], CACHE),
             ok("nix-push")
+        );
+    }
+
+    #[test]
+    fn an_access_is_a_credential_of_a_profile_for_cloudflare() {
+        let nix = json!({ "name": "nix", "access": { "audience": CACHE } });
+        let mut policy = with_profile(nix.clone());
+        let parsed = parse(&policy);
+        let access = parsed
+            .profiles
+            .iter()
+            .find(|p| p.name == "nix")
+            .and_then(|p| p.access.as_ref())
+            .expect("the profile has its access");
+        // The token is tagged with the host: what an Access policy matches.
+        assert_eq!(access.host(), "cloudflare-nix-api.example.com");
+
+        // It combines with a token, and the grant has both
+        let (profile, _) = parsed
+            .profiles_for("github", &claims(), &["deploy", "nix"], CLOUDFLARE_AUDIENCE)
+            .unwrap();
+        assert!(profile.token.is_some() && profile.access.is_some());
+
+        // Two applications can't be had in one grant, like two buckets
+        policy["profiles"].as_array_mut().unwrap().push(
+            json!({ "name": "nix-two", "access": { "audience": "https://other.example.com" } }),
+        );
+        assert_eq!(
+            scoped(&policy, claims(), &["nix", "nix-two"], CLOUDFLARE_AUDIENCE),
+            err(
+                "scopes nix, nix-two each have an access, and a service token is for one application: ask for one of them"
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_a_bad_access() {
+        // Not an origin, or the broker itself
+        for (audience, why) in [
+            ("https://nix.example.com/path", "must be a bare origin"),
+            (BROKER, "must be another service, not the broker"),
+        ] {
+            let err = parse_err(&with_profile(
+                json!({ "name": "nix", "access": { "audience": audience } }),
+            ));
+            assert!(
+                err.contains("profiles[2].access.audience") && err.contains(why),
+                "{audience}: {err}"
+            );
+        }
+        // An access is Cloudflare's: a profile for a service has no credentials
+        let err = parse_err(&with_profile(
+            json!({ "name": "nix", "audience": CACHE, "access": { "audience": CACHE } }),
+        ));
+        assert!(
+            err.contains("can't have a token, a bucket or an access"),
+            "{err}"
         );
     }
 

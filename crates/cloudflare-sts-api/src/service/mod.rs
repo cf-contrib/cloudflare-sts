@@ -12,6 +12,7 @@
 //! spec doesn't declare them. Readiness asks [`health`]'s check of the
 //! config, which reads the secrets.
 
+pub mod access;
 pub mod authz;
 pub mod config;
 pub mod handler;

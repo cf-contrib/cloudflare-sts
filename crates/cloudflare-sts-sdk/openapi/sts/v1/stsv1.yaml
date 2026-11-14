@@ -182,6 +182,33 @@ paths:
               $ref: '#/components/schemas/TokenExchangeRequest'
 components:
   schemas:
+    AccessCredentials:
+      type: object
+      required:
+        - token_id
+        - client_id
+        - client_secret
+        - audience
+        - expires_on
+      properties:
+        token_id:
+          type: string
+          description: The service token's ID, which revoking it takes.
+        client_id:
+          type: string
+        client_secret:
+          type: string
+        audience:
+          type: string
+          description: "The application the token is for: the profile's `access.audience`."
+        expires_on:
+          type: string
+          format: date-time
+      description: |-
+        A Cloudflare Access service token for the profile's `access.audience`: sent as the
+        `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers. It's created for the job
+        and deleted by revoking it. Cloudflare takes a moment, a few seconds, to honor a
+        new one.
     AuthorizationServerMetadata:
       type: object
       required:
@@ -311,11 +338,13 @@ components:
       enum:
         - urn:ietf:params:oauth:token-type:access_token
         - urn:cloudflare-sts:params:oauth:token-type:r2_credentials
+        - urn:cloudflare-sts:params:oauth:token-type:access_service_token
         - urn:ietf:params:oauth:token-type:jwt
       description: |-
         What the exchange issues: a Cloudflare API token (`access_token`), R2 credentials
-        alone (`r2_credentials`), or the broker's own JWT access token for a service
-        (`access_token`, or `jwt` if asked for by that name).
+        alone (`r2_credentials`), an Access service token alone (`access_service_token`), or
+        the broker's own JWT access token for a service (`access_token`, or `jwt` if asked
+        for by that name).
     Jwks:
       type: object
       required:
@@ -451,7 +480,9 @@ components:
             signed.
         issued_token_type:
           $ref: '#/components/schemas/IssuedTokenType'
-          description: '`access_token` with an `access_token`, `r2_credentials` without one, or `jwt` as asked for.'
+          description: |-
+            `access_token` with an `access_token`; without one, `r2_credentials` with a bucket or
+            else `access_service_token`; or `jwt` as asked for.
         token_type:
           type: string
           enum:
@@ -477,6 +508,9 @@ components:
         bucket:
           $ref: '#/components/schemas/BucketCredentials'
           description: The R2 credentials, for a profile with a bucket.
+        access:
+          $ref: '#/components/schemas/AccessCredentials'
+          description: The Access service token, for a profile with `access`.
     TokenRevocationRequest:
       type: object
       required:
@@ -486,12 +520,17 @@ components:
           type: string
           minLength: 1
           maxLength: 8192
-          description: The Cloudflare API token, as the exchange returned it in `access_token`.
+          description: |-
+            The Cloudflare API token, as the exchange returned it in `access_token`; or, with
+            the `access_service_token` hint, the service token's ID (`access.token_id`).
         token_type_hint:
           type: string
           enum:
             - access_token
-          description: 'If sent, `access_token`, and ignored: only Cloudflare API tokens the broker minted can be revoked.'
+            - urn:cloudflare-sts:params:oauth:token-type:access_service_token
+          description: |-
+            `access_token` (the default, and ignored), or the `access_service_token` URN to
+            revoke an Access service token. Only what the broker minted can be revoked.
 servers:
   - url: https://cloudflare-sts-api.example.com
     variables: {}

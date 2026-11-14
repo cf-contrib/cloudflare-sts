@@ -137,6 +137,18 @@ forward_claims = ["repository_owner_id", "environment"]
 bucket = { "name" = "org-other-state", "permission" = "object-read-only" }
 
 [[profiles]]
+name = "combo-access"
+provider = "github"
+forward_claims = ["repository_owner_id", "environment"]
+access = { audience = "https://cloudflare-nix-api.example.com" }
+
+[[profiles]]
+name = "combo-access-two"
+provider = "github"
+forward_claims = ["repository_owner_id", "environment"]
+access = { audience = "https://other-api.example.com" }
+
+[[profiles]]
 name = "nix-push"
 provider = "github"
 audience = "https://cloudflare-nix-api.example.com"

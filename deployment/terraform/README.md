@@ -51,6 +51,8 @@ by default deploys the broker of the release its `ref` points to.
   If any profile has a `bucket`, the token also needs R2 permissions
   covering what it delegates: it creates their credentials and is
   their parent (see [Buckets](../../crates/cloudflare-sts-api#buckets)).
+  If any profile has an `access`, it also needs **Access: Service Tokens Write**
+  (see [Access service tokens](../../crates/cloudflare-sts-api#access-service-tokens)).
 - A separate API token for *deploying*, exported as `CLOUDFLARE_API_TOKEN`, with:
   - **Account → Workers Scripts: Edit**
   - **Account → Secrets Store: Edit**, to bind the Cloudflare token's secret, and the signing key's if set
@@ -344,7 +346,7 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
 | `cloudflare_token_secret` | yes | | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the Cloudflare token. With a profile's `bucket`, the token also needs R2 permissions covering what it delegates. |
 | `signing_key_secret` | for profiles with an `audience` | `null` | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the RSA key the broker signs its own tokens with. See [Tokens for other services](../../crates/cloudflare-sts-api#tokens-for-other-services). |
 | `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ?, client_id? }` each. `audience` defaults to the `client_id` [people](../../crates/cloudflare-sts-api#people) sign in as, if there is one, and otherwise to the broker's URL. See [Policy](#policy). |
-| `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `audience`. See [Policy](#policy). |
+| `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `access`, `audience`. See [Policy](#policy). |
 | `cedar_policy` | yes | | Who gets what: Cedar text with a permit for `Admit::Action::"<provider>"` for every provider, pinning your org, and `Profile::Action::"<name>"` for every profile, each with an `@id`. See [Policy](#policy). |
 | `defaults` | no | `{}` | `{ ttl?, max_ttl? }`: the TTLs of profiles that don't set their own. |
 | `worker_dir` | no | `null` | A local build (`index.js`, `index_bg.wasm`) to deploy instead of a release. |
