@@ -56,6 +56,22 @@ when { context.environment == "lb-zone" };
 permit (principal, action == Profile::Action::"terraform-state", resource)
 when { context.repository like "example-org/state-*" && context.environment == "state" };
 
+@id("allow-combo-deploy")
+permit (principal, action == Profile::Action::"combo-deploy", resource)
+when { context.environment == "combo" };
+
+@id("allow-combo-lb")
+permit (principal, action == Profile::Action::"combo-lb", resource)
+when { context.environment == "combo" };
+
+@id("allow-combo-state")
+permit (principal, action == Profile::Action::"combo-state", resource)
+when { context.environment == "combo" };
+
+@id("allow-combo-state-two")
+permit (principal, action == Profile::Action::"combo-state-two", resource)
+when { context.environment == "combo" };
+
 @id("allow-whole-bucket")
 permit (principal, action == Profile::Action::"whole-bucket", resource)
 when { context.environment == "whole-bucket" };

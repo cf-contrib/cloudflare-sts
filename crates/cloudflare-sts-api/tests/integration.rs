@@ -1147,8 +1147,8 @@ mod tokens_for_other_services {
         assert_eq!(res.status, 400);
         assert_refused(
             &t.deny().await,
-            "invalid_request",
-            &format!("profile workers-deploy isn't for {CACHE}"),
+            "invalid_scope",
+            &format!("scope workers-deploy isn't for {CACHE}"),
         );
     }
 
@@ -1216,4 +1216,79 @@ async fn the_scheduled_cleanup_deletes_only_expired_broker_tokens() {
             .iter()
             .any(|r| r.method == "GET" && r.path.ends_with("/tokens"))
     );
+}
+
+mod several_scopes {
+    use super::*;
+
+    /// A job in the environment the `combo-*` profiles are for.
+    fn combo() -> String {
+        sign(github_claims(json!({ "environment": "combo" })))
+    }
+
+    #[tokio::test]
+    async fn combines_tokens_and_a_bucket_into_one_grant() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-deploy combo-lb combo-state")]).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        let body = res.json();
+        assert_eq!(body["scope"], "combo-deploy combo-lb combo-state");
+        assert!(body["access_token"].as_str().unwrap().starts_with("value-"));
+        assert_eq!(body["bucket"]["name"], "org-terraform-state");
+        // One token with both profiles' policies, and one set of bucket credentials
+        assert_eq!(
+            minted_policies(&token_id(&res)).as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(token_count(), 2); // the Cloudflare token, and the one minted
+        assert_eq!(r2_bodies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn takes_each_scope_once_in_the_order_given() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-lb  combo-deploy combo-lb")]).await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        assert_eq!(res.json()["scope"], "combo-lb combo-deploy");
+    }
+
+    #[tokio::test]
+    async fn refuses_two_buckets_without_calling_cloudflare() {
+        let t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-state combo-state-two")]).await;
+        assert_eq!(res.status, 400);
+        assert_error(&res, "invalid_scope");
+        assert_refused(
+            &t.deny().await,
+            "invalid_scope",
+            "each have a bucket, and R2 credentials are for one",
+        );
+        assert!(world().cloudflare.calls().is_empty());
+        assert_eq!(token_count(), 1); // only the Cloudflare token
+    }
+
+    #[tokio::test]
+    async fn refuses_them_all_when_one_isnt_allowed() {
+        let t = start().await;
+        // `workers-deploy` is for the prod environment, not this one
+        let res = job_token(&combo(), &[("scope", "combo-deploy workers-deploy")]).await;
+        assert_eq!(res.status, 400);
+        assert_error(&res, "invalid_scope");
+        assert_refused(
+            &t.deny().await,
+            "invalid_scope",
+            "scope workers-deploy doesn't match the token",
+        );
+        assert!(world().cloudflare.calls().is_empty());
+        assert_eq!(token_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn refuses_an_unknown_scope_as_invalid_scope() {
+        let _t = start().await;
+        let res = job_token(&combo(), &[("scope", "combo-deploy nope")]).await;
+        assert_eq!(res.status, 400);
+        assert_error(&res, "invalid_scope");
+        assert!(world().cloudflare.calls().is_empty());
+    }
 }
