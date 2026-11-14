@@ -41,8 +41,8 @@ try {
     grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
     subject_token: jwt,
     subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-    // Several profiles are one space-delimited scope (RFC 6749 §3.3); a newline-separated input is joined.
-    scope: input("scope").split(/\s+/).filter(Boolean).join(" ") || undefined,
+    // The profiles, separated by spaces or newlines, are sent as one space-delimited `scope` (RFC 6749 §3.3).
+    scope: input("scopes").split(/\s+/).filter(Boolean).join(" ") || undefined,
     ttl: input("ttl") || undefined,
   };
 

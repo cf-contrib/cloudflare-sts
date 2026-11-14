@@ -85,7 +85,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: stub-request-token
         with:
           url: http://127.0.0.1:8787
-          scope: smoke-r2
+          scopes: smoke-r2
       - name: Check Exported R2 Credentials
         run: |
           test -z "$CLOUDFLARE_API_TOKEN"   # r2 only: no API token
@@ -107,7 +107,7 @@ jobs:
           ACTIONS_ID_TOKEN_REQUEST_TOKEN: stub-request-token
         with:
           url: http://127.0.0.1:8787
-          scope: smoke
+          scopes: smoke
           ttl: 5m
       - name: Check Exported Token
         run: |

@@ -85,7 +85,7 @@ describe("main", () => {
     const r = await action("main.js", {
       ...oidcEnv(stub.url),
       INPUT_URL: `${stub.url}/`,
-      INPUT_SCOPE: "workers-deploy",
+      INPUT_SCOPES: "workers-deploy",
       INPUT_TTL: " 10m ",
     });
 
@@ -123,7 +123,7 @@ describe("main", () => {
     const r = await action("main.js", {
       ...oidcEnv(stub.url),
       INPUT_URL: stub.url,
-      INPUT_SCOPE: "example-org/app:ci.dns\n  example-org/app:ci.deploy  ",
+      INPUT_SCOPES: "example-org/app:ci.dns\n  example-org/app:ci.deploy  ",
     });
     expect(r.code).toBe(0);
     const token = stub.calls.find((c) => c.path === "/oauth/token");
@@ -135,7 +135,7 @@ describe("main", () => {
     const r = await action("main.js", {
       ...oidcEnv(stub.url),
       INPUT_URL: stub.url,
-      INPUT_SCOPE: "",
+      INPUT_SCOPES: "",
       INPUT_TTL: "",
     });
     expect(r.code).toBe(0);
@@ -162,7 +162,7 @@ describe("main", () => {
     const r = await action("main.js", {
       ...oidcEnv(stub.url),
       INPUT_URL: stub.url,
-      INPUT_SCOPE: STUB_R2_PROFILE,
+      INPUT_SCOPES: STUB_R2_PROFILE,
     });
 
     expect(r.code).toBe(0);
