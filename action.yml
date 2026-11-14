@@ -8,9 +8,9 @@ inputs:
   url:
     required: true
     description: Broker base URL, e.g. https://cloudflare-sts-api.example.com. Its origin is the OIDC audience, and must equal the GitHub provider's audience in the policy.
-  profile:
+  scope:
     required: false
-    description: Policy profile to request (not an AWS profile). Recommended when more than one profile could match.
+    description: Policy profiles to request, separated by spaces or newlines (not AWS profiles). Every one must allow the workflow. Recommended when more than one profile could match.
   ttl:
     required: false
     description: Requested lifetime such as 10m or 1h, for the token and R2 credentials alike. Defaults to the profile's ttl, capped at its max_ttl.

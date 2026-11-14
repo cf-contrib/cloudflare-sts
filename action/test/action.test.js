@@ -85,7 +85,7 @@ describe("main", () => {
     const r = await action("main.js", {
       ...oidcEnv(stub.url),
       INPUT_URL: `${stub.url}/`,
-      INPUT_PROFILE: "workers-deploy",
+      INPUT_SCOPE: "workers-deploy",
       INPUT_TTL: " 10m ",
     });
 
@@ -98,7 +98,7 @@ describe("main", () => {
     expect(maskAt).toBeGreaterThanOrEqual(0);
     expect(out.some((l) => l.startsWith("::add-mask::stub-jwt."))).toBe(true);
     expect(r.stdout).toContain(
-      `cloudflare-sts: minted token ${STUB_TOKEN_ID} (profile workers-deploy, expires 2026-09-28T12:15:00Z)`,
+      `cloudflare-sts: minted token ${STUB_TOKEN_ID} (scope workers-deploy, expires 2026-09-28T12:15:00Z)`,
     );
     // The token value itself only ever appears in the mask command.
     expect(out.filter((l) => l.includes(STUB_TOKEN)).length).toBe(1);
@@ -113,17 +113,29 @@ describe("main", () => {
       // The audience is the broker's origin, without the trailing slash.
       subject_token: `stub-jwt.${Buffer.from(stub.url).toString("base64url")}`,
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
-      profile: "workers-deploy",
+      scope: "workers-deploy",
       ttl: "10m",
     });
   });
 
-  it("omits profile and ttl when not given", async () => {
+  it("sends several scopes as one space-delimited scope", async () => {
     stub = await startStub();
     const r = await action("main.js", {
       ...oidcEnv(stub.url),
       INPUT_URL: stub.url,
-      INPUT_PROFILE: "",
+      INPUT_SCOPE: "example-org/app:ci.dns\n  example-org/app:ci.deploy  ",
+    });
+    expect(r.code).toBe(0);
+    const token = stub.calls.find((c) => c.path === "/oauth/token");
+    expect(token?.body).toMatchObject({ scope: "example-org/app:ci.dns example-org/app:ci.deploy" });
+  });
+
+  it("omits scope and ttl when not given", async () => {
+    stub = await startStub();
+    const r = await action("main.js", {
+      ...oidcEnv(stub.url),
+      INPUT_URL: stub.url,
+      INPUT_SCOPE: "",
       INPUT_TTL: "",
     });
     expect(r.code).toBe(0);
@@ -150,14 +162,14 @@ describe("main", () => {
     const r = await action("main.js", {
       ...oidcEnv(stub.url),
       INPUT_URL: stub.url,
-      INPUT_PROFILE: STUB_R2_PROFILE,
+      INPUT_SCOPE: STUB_R2_PROFILE,
     });
 
     expect(r.code).toBe(0);
     expect(r.env).toEqual({ CLOUDFLARE_ACCOUNT_ID: STUB_ACCOUNT_ID, ...BUCKET_ENV });
     expect(r.state).toEqual({ r2_expires_on: STUB_BUCKET.expires_on });
     expect(r.stdout).toContain(
-      "cloudflare-sts: issued R2 credentials for bucket org-terraform-state under github.com/example-org/app/ (profile smoke-r2, expires 2026-09-28T12:15:00Z)",
+      "cloudflare-sts: issued R2 credentials for bucket org-terraform-state under github.com/example-org/app/ (scope smoke-r2, expires 2026-09-28T12:15:00Z)",
     );
     expect(r.stdout).not.toContain("minted token");
     // The secrets only ever appear in the mask commands.

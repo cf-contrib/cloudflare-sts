@@ -130,12 +130,13 @@ paths:
       operationId: exchangeToken
       summary: Exchange an OIDC token for a Cloudflare API token and/or R2 credentials.
       description: |-
-        The subject token is in the body, not an `Authorization` header. Which profile
-        applies follows the policy: a named `profile` must match, otherwise exactly one
-        profile must. Anything unsupported, such as `actor_token`, is refused rather than
-        ignored. An invalid subject token, or one the policy doesn't take, is
-        `invalid_request`, as RFC 8693 §2.2.2 has it; an `audience` the broker issues
-        nothing for is `invalid_target`.
+        The subject token is in the body, not an `Authorization` header. Which profiles
+        apply follows the policy: every profile named in `scope` must match the caller,
+        otherwise exactly one profile must. Anything unsupported, such as `actor_token`, is
+        refused rather than ignored. An invalid subject token, or one the policy doesn't take,
+        is `invalid_request`, as RFC 8693 §2.2.2 has it; an `audience` the broker issues
+        nothing for is `invalid_target`, and a `scope` that names an unknown profile, or one
+        the caller can't have, or profiles that can't be combined, is `invalid_scope`.
       parameters: []
       responses:
         '200':
@@ -278,6 +279,7 @@ components:
       type: string
       enum:
         - invalid_request
+        - invalid_scope
         - invalid_target
         - unsupported_grant_type
         - server_error
@@ -417,10 +419,15 @@ components:
             has. For Cloudflare's audience, `access_token` or `r2_credentials`; for a
             service's, `jwt` or `access_token`, two names for the same JWT. Any other is
             `invalid_target`.
-        profile:
+        scope:
           type: string
-          maxLength: 255
-          description: Profile to use. If omitted, exactly one profile must match.
+          maxLength: 1024
+          description: |-
+            The profiles to get, as a space-delimited list (RFC 6749 §3.3, RFC 8693 §2.1). The
+            caller must be allowed every one, or the request is `invalid_scope` and nothing is
+            issued. Profiles for the Cloudflare audience are combined into one grant: their token
+            policies together, and at most one bucket. A profile for another service's audience
+            can't be combined. If omitted, exactly one profile must match.
         ttl:
           type: string
           maxLength: 16
@@ -434,7 +441,7 @@ components:
         - token_type
         - expires_in
         - expires_at
-        - profile
+        - scope
       properties:
         access_token:
           type: string
@@ -464,9 +471,9 @@ components:
         account_id:
           type: string
           description: The Cloudflare account, for the Cloudflare audience.
-        profile:
+        scope:
           type: string
-          description: The profile that allowed the exchange.
+          description: The profiles that were granted, space-delimited (RFC 8693 §2.2.1).
         bucket:
           $ref: '#/components/schemas/BucketCredentials'
           description: The R2 credentials, for a profile with a bucket.
