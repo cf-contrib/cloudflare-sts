@@ -25,11 +25,11 @@ export interface TokenExchangeRequest {
   subject_token: string;
   /** What `subject_token` is. */
   subject_token_type: SubjectTokenType;
-  /** The kind of token wanted, when the profiles could return more than one. */
+  /** Checked, not used to choose: what's issued is what the profile has. */
   requested_token_type?: IssuedTokenType | undefined;
   /** The profiles to get, space-delimited. */
   scope?: string | undefined;
-  /** How long the credentials should last, if shorter than the profile's own limit. */
+  /** Requested lifetime such as `10m` or `1h`, capped at the profile's `max_ttl`. */
   ttl?: string | undefined;
 }
 
