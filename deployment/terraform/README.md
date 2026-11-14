@@ -56,9 +56,12 @@ by default deploys the broker of the release its `ref` points to.
 - A separate API token for *deploying*, exported as `CLOUDFLARE_API_TOKEN`, with:
   - **Account → Workers Scripts: Edit**
   - **Account → Secrets Store: Edit**, to bind the Cloudflare token's secret
+  - **Account → Workers KV Storage: Edit**, for the namespace that holds the policy (the
+    `config` and `policy` keys): without it the apply fails with `Authentication error`
+    (code `10000`) creating the namespace
   - **Zone → Workers Routes: Edit** on the broker's zone, only for a custom domain (not tested yet)
 
-  The first two were enough for a workers.dev deploy in testing.
+  The first two were enough for a workers.dev deploy in testing, before the policy moved to KV.
 - (Optional) `GITHUB_TOKEN` if you hit anonymous GitHub API rate limits.
 
 ## Usage
