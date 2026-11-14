@@ -19,9 +19,6 @@
 //! expires: [`verified`] reads it back, so whoever verified a token can hand
 //! it to whatever runs next without verifying it again.
 //!
-//! A Worker that issues its own tokens signs them with a [`SigningKey`], an RSA
-//! key imported into WebCrypto, and publishes its [`SigningKey::public_jwk`].
-//!
 //! The futures aren't `Send`: they hold JavaScript values. A Worker is
 //! single-threaded, so a caller that needs `Send`, such as an axum handler,
 //! wraps them in `worker::send::SendFuture`.
@@ -35,19 +32,16 @@
 //! - `verify`: the resource server's side: providers and the tokens verified
 //!   from them, their `keys` (RFC 7517) and `metadata` (OpenID Connect
 //!   Discovery, RFC 8414), and the claim rules' `policy`;
-//! - `sign`: the issuer's side;
-//! - `crypto`: RS256 through WebCrypto, for both;
+//! - `crypto`: RS256 through WebCrypto;
 //! - `error`: what goes wrong.
 
 mod crypto;
 mod error;
 mod jwt;
-mod sign;
 mod verify;
 
 pub use crate::oidc::{
     error::{Error, KeyError},
-    jwt::{ALGORITHM, AT_JWT, AccessTokenClaims, Claims, Header, Jwt},
-    sign::SigningKey,
+    jwt::{ALGORITHM, Claims, Header, Jwt},
     verify::{Provider, Providers, check_url, verified},
 };

@@ -37,34 +37,19 @@ variable "cloudflare_token_secret" {
   description = "Secrets Store secret holding the Cloudflare token: an account-owned token with \"Account API Tokens Write\", plus R2 permissions covering what profiles' buckets delegate (it creates those credentials and is their parent), plus \"Access: Service Tokens Write\" if any profile has an `access`. Terraform only references it; the value never enters state."
 }
 
-variable "signing_key_secret" {
-  type = object({
-    secret_store_id = string
-    secret_name     = string
-  })
-  description = "Secrets Store secret holding the RSA private key (PKCS#8 PEM, at least 2048 bits, e.g. from `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072`) the broker signs its own tokens with. Needed only for profiles with an audience. Terraform only references it; the value never enters state."
-  default     = null
-}
-
 variable "oidc_providers" {
   type = list(object({
-    name      = string
-    issuer    = string
-    audience  = optional(string)
-    jwks_uri  = optional(string)
-    typ       = optional(string)
-    client_id = optional(string)
+    name     = string
+    issuer   = string
+    audience = optional(string)
+    jwks_uri = optional(string)
+    typ      = optional(string)
   }))
-  description = "The OIDC issuers whose tokens the broker takes: the policy's providers. Each has a name for profiles to refer to, its issuer, the audience its tokens must have (the broker's URL by default, which is what the action asks for), optionally where its keys are, the typ its tokens must have (such as at+jwt), and, for one people sign in with, the client_id they sign in as, which is then its audience. Which of a provider's tokens get in is the `cedar_policy`'s: it must admit every provider. See the broker's README."
+  description = "The OIDC issuers whose tokens the broker takes: the policy's providers. Each has a name for profiles to refer to, its issuer, the audience its tokens must have (the broker's URL by default, which is what the action asks for), optionally where its keys are, and the typ its tokens must have (such as at+jwt). For one people sign in with, the audience is the client they sign in as. Which of a provider's tokens get in is the `cedar_policy`'s: it must admit every provider. See the broker's README."
 
   validation {
     condition     = length(var.oidc_providers) > 0
     error_message = "Name at least one provider."
-  }
-
-  validation {
-    condition     = alltrue([for provider in var.oidc_providers : provider.audience == null || provider.client_id == null || provider.audience == provider.client_id])
-    error_message = "A provider with a client_id has it as its audience: leave audience out."
   }
 }
 

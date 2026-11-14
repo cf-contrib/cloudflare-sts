@@ -7,43 +7,43 @@ export type SubjectTokenType = "urn:ietf:params:oauth:token-type:id_token" | "ur
 
 /**
  * What comes back: a Cloudflare API token, only R2 credentials for a profile without a
- * `token`, or, for another service's audience, a JWT access token (RFC 9068) the broker
- * signed: `access_token`, or `jwt` if that's what was requested.
+ * `token`, or only an Access service token for a profile with just an `access`.
  */
 export type IssuedTokenType =
   | "urn:ietf:params:oauth:token-type:access_token"
   | "urn:cloudflare-sts:params:oauth:token-type:r2_credentials"
-  | "urn:cloudflare-sts:params:oauth:token-type:access_service_token"
-  | "urn:ietf:params:oauth:token-type:jwt";
+  | "urn:cloudflare-sts:params:oauth:token-type:access_service_token";
 
 /**
  * Body of `POST /oauth/token`, an RFC 8693 token exchange, form-encoded. `scope` is
  * the profiles to get, space-delimited, and `ttl` is the broker's own extension parameter.
  */
 export interface TokenExchangeRequest {
+  /** Always the RFC 8693 token-exchange grant. */
   grant_type: "urn:ietf:params:oauth:grant-type:token-exchange";
+  /** The OIDC token that proves who the caller is. */
   subject_token: string;
+  /** What `subject_token` is. */
   subject_token_type: SubjectTokenType;
-  /**
-   * `https://api.cloudflare.com` (the default) for Cloudflare credentials, or the URL of a
-   * service the policy issues the broker's own tokens for.
-   */
-  audience?: string | undefined;
+  /** Checked, not used to choose: what's issued is what the profile has. */
   requested_token_type?: IssuedTokenType | undefined;
+  /** The profiles to get, space-delimited. */
   scope?: string | undefined;
+  /** Requested lifetime such as `10m` or `1h`, capped at the profile's `max_ttl`. */
   ttl?: string | undefined;
 }
 
 /**
- * `200` response of `POST /oauth/token`. A profile with only a `bucket` has no bearer token,
- * so it returns no `access_token` and `token_type: "N_A"`, with the credentials in `bucket`.
- * For another service's audience, `access_token` is a JWT access token (RFC 9068, `typ`
- * `at+jwt`) the broker signed, verifiable with the keys its metadata
- * (`/.well-known/oauth-authorization-server`, RFC 8414) names.
+ * `200` response of `POST /oauth/token`. A profile with only a `bucket` or an `access` has
+ * no bearer token, so it returns no `access_token` and `token_type: "N_A"`, with the
+ * credentials in `bucket` or `access`.
  */
 export interface TokenExchangeResponse {
+  /** The Cloudflare API token. Absent for a profile with only a `bucket` or an `access`. */
   access_token?: string;
+  /** What `access_token`, or the credentials in `bucket` or `access`, is. */
   issued_token_type: IssuedTokenType;
+  /** `Bearer` with an `access_token`, otherwise `N_A`. */
   token_type: "Bearer" | "N_A";
   /** Seconds until the token, or the R2 credentials, expire. */
   expires_in: number;
@@ -51,9 +51,11 @@ export interface TokenExchangeResponse {
   expires_at: number;
   /** The Cloudflare API token's ID, present with `access_token`. */
   token_id?: string;
-  /** The Cloudflare account, for the Cloudflare audience. */
+  /** The Cloudflare account. */
   account_id?: string;
+  /** The profiles granted, space-delimited. */
   scope: string;
+  /** The R2 credentials, for a profile with a `bucket`. */
   bucket?: BucketCredentials;
   /** The Access service token, for a profile with `access`. */
   access?: AccessCredentials;
@@ -65,6 +67,7 @@ export interface TokenExchangeResponse {
  * which it never deletes.
  */
 export interface TokenRevocationRequest {
+  /** The Cloudflare API token to revoke, or the Access service token's ID (see `token_type_hint`). */
   token: string;
   /**
    * `access_token` (the default, and ignored): only Cloudflare API tokens the broker minted
@@ -80,7 +83,9 @@ export interface TokenRevocationRequest {
 export interface AccessCredentials {
   /** The service token's ID, which revoking it takes. */
   token_id: string;
+  /** Sent as the `CF-Access-Client-Id` header. */
   client_id: string;
+  /** Sent as the `CF-Access-Client-Secret` header. */
   client_secret: string;
   /** The application the token is for. */
   audience: string;
@@ -92,8 +97,11 @@ export interface AccessCredentials {
 export interface BucketCredentials {
   /** The bucket's name. */
   name: string;
+  /** The S3 access key ID. */
   access_key_id: string;
+  /** The S3 secret access key. */
   secret_access_key: string;
+  /** The S3 session token, sent with the key pair. */
   session_token: string;
   /** Filled in from the caller's claims. Empty means the whole bucket. */
   prefixes: string[];
@@ -121,6 +129,8 @@ export type ErrorCode =
  * description is generic.
  */
 export interface Error {
+  /** What kind of error it is. */
   error: ErrorCode;
+  /** A human-readable explanation. */
   error_description: string;
 }

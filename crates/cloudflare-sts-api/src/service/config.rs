@@ -63,17 +63,8 @@ const POLICY_TTL: f64 = 60_000.0;
 /// Write", plus R2 permissions covering what profiles' buckets delegate.
 const CLOUDFLARE_TOKEN_KEY: &str = "CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN";
 
-/// The binding of the RSA private key (PKCS#8 PEM, at least 2048 bits) the
-/// broker signs its own tokens with. Optional: without it, the broker issues
-/// none and publishes no keys.
-const SIGNING_KEY_KEY: &str = "CLOUDFLARE_STS_API_SIGNING_KEY";
-
 /// Where Cloudflare's API is.
 const CLOUDFLARE_URL: &str = "https://api.cloudflare.com/client/v4";
-
-/// The audience for Cloudflare API tokens and R2 credentials, and every
-/// profile's default.
-pub const CLOUDFLARE_AUDIENCE: &str = "https://api.cloudflare.com";
 
 /// The scopes of Cloudflare's permission groups, which a token policy's
 /// resources fall under.
@@ -97,9 +88,6 @@ pub struct Config {
     policy: Arc<PolicyConfig>,
     /// The account tokens are minted in, and its API.
     cloudflare: CloudflareConfig,
-    /// `CLOUDFLARE_STS_API_SIGNING_KEY`'s binding. None issues no tokens of
-    /// the broker's own.
-    signing_key: Option<Secret>,
 }
 
 impl Config {
@@ -113,11 +101,7 @@ impl Config {
     pub async fn load(env: &Env) -> worker::Result<Self> {
         let cloudflare = CloudflareConfig::from_env(env)?;
         let policy = load_policy(env, cloudflare.account_id()).await?;
-        Ok(Self {
-            policy,
-            cloudflare,
-            signing_key: Secret::from_env(env, SIGNING_KEY_KEY)?,
-        })
+        Ok(Self { policy, cloudflare })
     }
 
     /// The policy.
@@ -128,14 +112,6 @@ impl Config {
     /// The account tokens are minted in, and its API.
     pub fn cloudflare(&self) -> &CloudflareConfig {
         &self.cloudflare
-    }
-
-    /// Reads the signing key, a PKCS#8 PEM, or `None` if none is bound.
-    pub async fn signing_key(&self) -> worker::Result<Option<String>> {
-        match &self.signing_key {
-            Some(secret) => secret.read().await.map(Some),
-            None => Ok(None),
-        }
     }
 }
 
@@ -364,7 +340,7 @@ impl PolicyConfig {
     /// Whether `provider` lets the token with `claims` in at all: its tenant,
     /// pinned. Checked as the token is verified.
     pub fn admit(&self, provider: &str, claims: &Map<String, Value>) -> Verdict {
-        self.authz.admit(provider, claims, CLOUDFLARE_AUDIENCE)
+        self.authz.admit(provider, claims)
     }
 
     /// What deserializing can't check, filling in each profile's provider and
@@ -375,9 +351,6 @@ impl PolicyConfig {
         }
         check_origin(&self.issuer).map_err(|why| format!("issuer {why}"))?;
 
-        for (index, provider) in self.providers.iter_mut().enumerate() {
-            provider.resolve(&format!("providers[{index}]"))?;
-        }
         self.providers.check("providers")?;
         for (index, provider) in self.providers.iter().enumerate() {
             let at = format!("providers[{index}]");
@@ -407,13 +380,6 @@ impl PolicyConfig {
             profile.check(&at, &self.issuer, account_id)?;
         }
         Ok(())
-    }
-
-    /// The providers people sign in with: those with a `client_id`.
-    pub fn identity_providers(&self) -> impl Iterator<Item = &ProviderConfig> {
-        self.providers
-            .iter()
-            .filter(|provider| provider.client_id.is_some())
     }
 
     /// The provider a token's claims say it comes from, by its `iss`.
@@ -448,7 +414,6 @@ impl PolicyConfig {
         provider: &str,
         claims: &Map<String, Value>,
         requested: &[&str],
-        audience: &str,
     ) -> Result<(ProfileConfig, Vec<String>), Refusal> {
         // The `@id`s of the policies that allowed it, if any did. A `forbid`
         // that fired is logged: the caller is only told nothing matched.
@@ -456,7 +421,7 @@ impl PolicyConfig {
             if !p.enabled {
                 return None;
             }
-            let verdict = self.authz.profile(&p.name, claims, &p.audience);
+            let verdict = self.authz.profile(&p.name, claims);
             if verdict.allowed {
                 return Some(verdict.policies);
             }
@@ -465,10 +430,7 @@ impl PolicyConfig {
             }
             None
         };
-        let profiles = self
-            .profiles
-            .iter()
-            .filter(|p| p.provider == provider && p.audience == audience);
+        let profiles = self.profiles.iter().filter(|p| p.provider == provider);
 
         if !requested.is_empty() {
             // Each scope once, in the order given.
@@ -491,9 +453,6 @@ impl PolicyConfig {
                         None => format!("unknown scope {name}"),
                         Some(named) if named.provider != provider => {
                             format!("scope {name} isn't for provider {provider}")
-                        }
-                        Some(named) if named.audience != audience => {
-                            format!("scope {name} isn't for {audience}")
                         }
                         Some(named) if !named.enabled => format!("scope {name} is disabled"),
                         Some(_) => format!("scope {name} doesn't match the token"),
@@ -560,7 +519,8 @@ pub struct ProviderConfig {
     pub name: String,
     /// Matched exactly against a token's `iss`.
     pub issuer: String,
-    /// A value the token's `aud` must have: its `client_id` if left out.
+    /// A value the token's `aud` must have: for an ID token people sign in
+    /// for, the client it was issued to.
     #[serde(default)]
     pub audience: String,
     /// Where its keys are. `None` means its metadata says.
@@ -571,11 +531,6 @@ pub struct ProviderConfig {
     /// signs can't pass for one. `None` takes any.
     #[serde(default)]
     pub typ: Option<String>,
-    /// The OAuth client people sign in to it as, for an ID token whose `aud`
-    /// is this client: the metadata tells clients such as cf-vault. `None` for
-    /// a provider only machines get tokens from, such as GitHub Actions.
-    #[serde(default)]
-    pub client_id: Option<String>,
 }
 
 /// What the auth layer verifies a token from it against.
@@ -598,27 +553,6 @@ impl Provider for ProviderConfig {
 }
 
 impl ProviderConfig {
-    /// Fills in the audience from the client ID when it's left out, before
-    /// the providers are checked.
-    fn resolve(&mut self, at: &str) -> Result<(), String> {
-        let Some(client_id) = &self.client_id else {
-            return Ok(());
-        };
-        if client_id.is_empty() {
-            return Err(format!("{at}.client_id must not be empty"));
-        }
-        // An ID token's aud is the client it was issued to: another audience
-        // would refuse every token people sign in for.
-        if self.audience.is_empty() {
-            self.audience = client_id.clone();
-        } else if self.audience != *client_id {
-            return Err(format!(
-                "{at}.audience must be its client_id, {client_id}, or left out"
-            ));
-        }
-        Ok(())
-    }
-
     fn check(&self, at: &str) -> Result<(), String> {
         // Its issuer, jwks_uri and audience are the providers' check.
         check_provider_name(&self.name).map_err(|why| format!("{at}.name {why}"))?;
@@ -654,13 +588,9 @@ pub struct ProfileConfig {
     /// a request names it.
     #[serde(default = "ProfileConfig::enabled_by_default")]
     pub enabled: bool,
-    /// What it issues for: Cloudflare credentials, or the broker's own token
-    /// for another service.
-    #[serde(default = "ProfileConfig::cloudflare_audience")]
-    pub audience: String,
-    /// The claims of the caller's token to log and to copy into a token the
-    /// broker signs for another service: what that service may match on, as
-    /// the Cedar policy matched on them. Nothing else is copied.
+    /// The claims of the caller's token to log: what the audit log says
+    /// about who asked, as the Cedar policy matched on them. Nothing else is
+    /// logged.
     #[serde(default)]
     pub forward_claims: Vec<String>,
     /// For everything it hands out, the token and the bucket's credentials,
@@ -682,10 +612,6 @@ pub struct ProfileConfig {
 impl ProfileConfig {
     fn enabled_by_default() -> bool {
         true
-    }
-
-    fn cloudflare_audience() -> String {
-        CLOUDFLARE_AUDIENCE.to_string()
     }
 
     /// Fills in what the policy leaves to be: its provider, when there's
@@ -772,14 +698,6 @@ impl ProfileConfig {
             return Ok((*first).clone());
         }
         let names = profiles.iter().map(|p| p.name.as_str());
-        if first.audience != CLOUDFLARE_AUDIENCE {
-            // The broker's own token carries one profile's claims.
-            return Err(format!(
-                "scopes {} are for {}, which takes one scope",
-                names.collect::<Vec<_>>().join(", "),
-                first.audience
-            ));
-        }
         let with_bucket: Vec<&str> = profiles
             .iter()
             .filter(|p| p.bucket.is_some())
@@ -817,7 +735,6 @@ impl ProfileConfig {
             name: names.collect::<Vec<_>>().join(" "),
             provider: first.provider.clone(),
             enabled: true,
-            audience: first.audience.clone(),
             forward_claims,
             ttl: profiles.iter().map(|p| p.ttl).min().unwrap_or(first.ttl),
             max_ttl: profiles
@@ -836,29 +753,10 @@ impl ProfileConfig {
         check_forward_claims(&self.forward_claims)
             .map_err(|why| format!("{at}.forward_claims {why}"))?;
 
-        // Guardrail 5: audiences are kept apart. The broker signs its own
-        // token for another service; Cloudflare credentials are another
-        // profile's job.
-        let credentials = self.token.is_some() || self.bucket.is_some() || self.access.is_some();
-        if self.audience == CLOUDFLARE_AUDIENCE {
-            if !credentials {
-                return Err(format!(
-                    "{at} must have a token, a bucket, an access, or a mix"
-                ));
-            }
-        } else {
-            check_origin(&self.audience).map_err(|why| format!("{at}.audience {why}"))?;
-            if self.audience == issuer {
-                return Err(format!(
-                    "{at}.audience must be another service, not the broker"
-                ));
-            }
-            if credentials {
-                return Err(format!(
-                    "{at}: a profile for {} can't have a token, a bucket or an access",
-                    self.audience
-                ));
-            }
+        if self.token.is_none() && self.bucket.is_none() && self.access.is_none() {
+            return Err(format!(
+                "{at} must have a token, a bucket, an access, or a mix"
+            ));
         }
 
         if let Some(token) = &self.token {
@@ -1378,30 +1276,11 @@ fn parse_duration(value: &str) -> Option<u64> {
     (total > 0).then_some(total)
 }
 
-/// Names the broker's tokens already have, which a copied claim must not take
-/// the place of.
-const RESERVED_CLAIMS: [&str; 10] = [
-    "iss",
-    "sub",
-    "aud",
-    "exp",
-    "iat",
-    "nbf",
-    "jti",
-    "client_id",
-    "provider",
-    "profile",
-];
-
-/// That `names` are claim names to copy: non-empty, not repeated, and not ones
-/// the broker's tokens set themselves.
+/// That `names` are claim names to log: non-empty and not repeated.
 fn check_forward_claims(names: &[String]) -> Result<(), String> {
     for (index, name) in names.iter().enumerate() {
         if name.is_empty() {
             return Err("must not have an empty name".to_string());
-        }
-        if RESERVED_CLAIMS.contains(&name.as_str()) {
-            return Err(format!("can't copy {name}: the broker's tokens set it"));
         }
         if names[..index].contains(name) {
             return Err(format!("names {name} twice"));
@@ -1423,7 +1302,7 @@ pub(super) mod tests {
     pub(crate) const CACHE: &str = "https://cloudflare-nix-api.example.com";
 
     /// A policy: one provider, pinned to the test org, a profile for
-    /// Cloudflare, and one for the cache.
+    /// Cloudflare, and one that's switched off.
     pub(crate) fn policy() -> Value {
         json!({
             "version": 4,
@@ -1435,7 +1314,7 @@ pub(super) mod tests {
                     "forward_claims": ["repository", "ref"],
                     "token": { "policies": [{ "permissions": ["Workers Scripts Write"], "resources": { (format!("com.cloudflare.api.account.{ACCOUNT_ID}")): "*" } }] },
                 },
-                { "name": "nix-push", "audience": CACHE, "forward_claims": ["repository_owner_id", "ref"] },
+                { "name": "archive", "enabled": false, "forward_claims": ["repository_owner_id", "ref"], "bucket": { "name": "org-archive", "permission": "object-read-only" } },
             ],
         })
     }
@@ -1527,7 +1406,6 @@ pub(super) mod tests {
         let policy = parse(&with("/defaults", json!({ "max_ttl": "2h" })));
         let deploy = &policy.profiles[0];
         assert_eq!(deploy.provider, "github");
-        assert_eq!(deploy.audience, CLOUDFLARE_AUDIENCE);
         assert!(deploy.enabled);
         assert_eq!((deploy.ttl, deploy.max_ttl), (15 * MINUTE, 2 * HOUR));
 
@@ -1536,26 +1414,6 @@ pub(super) mod tests {
         ));
         let short = &policy.profiles[2];
         assert_eq!((short.ttl, short.max_ttl), (90 * SECOND, 5 * MINUTE));
-    }
-
-    #[test]
-    fn names_the_providers_people_sign_in_with_by_their_client_id() {
-        assert_eq!(parse(&policy()).identity_providers().count(), 0);
-
-        let mut both = policy();
-        both["providers"].as_array_mut().unwrap().extend([
-            json!({ "name": "access", "issuer": "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc", "client_id": "abc"  }),
-            json!({ "name": "okta", "issuer": "https://example.okta.com", "audience": "0oa1", "client_id": "0oa1"  }),
-        ]);
-        both["profiles"][0]["provider"] = json!("github");
-        both["profiles"][1]["provider"] = json!("github");
-        let policy = parse(&both);
-        let people: Vec<(&str, &str)> = policy
-            .identity_providers()
-            .map(|p| (p.name.as_str(), p.audience.as_str()))
-            .collect();
-        // The audience is the client ID, whether it's said or not.
-        assert_eq!(people, [("access", "abc"), ("okta", "0oa1")]);
     }
 
     #[test]
@@ -1681,22 +1539,6 @@ pub(super) mod tests {
             let err = parse_err(&policy);
             assert!(err.contains(expected), "{expected}: {err}");
         }
-
-        for (field, value, expected) in [
-            (
-                "client_id",
-                json!(""),
-                "providers[0].client_id must not be empty",
-            ),
-            (
-                "client_id",
-                json!("abc"),
-                "providers[0].audience must be its client_id, abc, or left out",
-            ),
-        ] {
-            let err = parse_err(&with(&format!("/providers/0/{field}"), value));
-            assert_eq!(err, expected);
-        }
     }
 
     #[test]
@@ -1802,29 +1644,17 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn keeps_audiences_apart() {
-        let cases = [
-            (
-                json!({ "name": "nothing"  }),
-                "profiles[2] must have a token, a bucket, an access, or a mix",
-            ),
-            (
-                json!({ "name": "both", "audience": CACHE , "token": token() }),
-                "a profile for https://cloudflare-nix-api.example.com can't have a token, a bucket or an access",
-            ),
-            (
-                json!({ "name": "self", "audience": BROKER  }),
-                "must be another service, not the broker",
-            ),
-            (
-                json!({ "name": "path", "audience": format!("{CACHE}/x")  }),
-                "must be a bare origin",
-            ),
-        ];
-        for (profile, expected) in cases {
-            let err = parse_err(&with_profile(profile));
-            assert!(err.contains(expected), "{expected}: {err}");
-        }
+    fn needs_a_credential() {
+        let err = parse_err(&with_profile(json!({ "name": "nothing" })));
+        assert!(
+            err.contains("profiles[2] must have a token, a bucket, an access, or a mix"),
+            "{err}"
+        );
+        // A profile has no audience: the broker issues Cloudflare's credentials only.
+        let err = parse_err(&with_profile(
+            json!({ "name": "svc", "audience": CACHE, "token": token() }),
+        ));
+        assert!(err.contains("unknown field `audience`"), "{err}");
     }
 
     #[test]
@@ -1947,10 +1777,9 @@ pub(super) mod tests {
         policy: &Value,
         claims: Map<String, Value>,
         requested: Option<&str>,
-        audience: &str,
     ) -> Result<String, String> {
         let scopes: Vec<&str> = requested.into_iter().collect();
-        scoped(policy, claims, &scopes, audience)
+        scoped(policy, claims, &scopes)
     }
 
     /// The same for several scopes: the combined profile's name, or why not.
@@ -1958,10 +1787,9 @@ pub(super) mod tests {
         policy: &Value,
         claims: Map<String, Value>,
         scopes: &[&str],
-        audience: &str,
     ) -> Result<String, String> {
         parse(policy)
-            .profiles_for("github", &claims, scopes, audience)
+            .profiles_for("github", &claims, scopes)
             .map(|(profile, _)| profile.name)
             .map_err(|refusal| match refusal {
                 Refusal::Scope(why) | Refusal::Request(why) => why,
@@ -1980,45 +1808,18 @@ pub(super) mod tests {
     fn selects_the_one_matching_profile_or_says_why_not() {
         let policy = policy();
         let main = claims();
-        assert_eq!(
-            selected(&policy, main.clone(), None, CLOUDFLARE_AUDIENCE),
-            ok("deploy")
-        );
-        assert_eq!(selected(&policy, main.clone(), None, CACHE), ok("nix-push"));
+        assert_eq!(selected(&policy, main.clone(), None), ok("deploy"));
 
         let mut dev = claims();
         dev.insert("ref".into(), "refs/heads/dev".into());
         let cases = [
-            (
-                dev.clone(),
-                None,
-                CLOUDFLARE_AUDIENCE,
-                "no profile matches the token",
-            ),
-            (
-                dev,
-                Some("deploy"),
-                CLOUDFLARE_AUDIENCE,
-                "scope deploy doesn't match the token",
-            ),
-            (
-                main.clone(),
-                Some("nope"),
-                CLOUDFLARE_AUDIENCE,
-                "unknown scope nope",
-            ),
-            (
-                main,
-                Some("deploy"),
-                CACHE,
-                "scope deploy isn't for https://cloudflare-nix-api.example.com",
-            ),
+            (dev.clone(), None, "no profile matches the token"),
+            (dev, Some("deploy"), "scope deploy doesn't match the token"),
+            (main.clone(), Some("nope"), "unknown scope nope"),
+            (main, Some("archive"), "scope archive is disabled"),
         ];
-        for (claims, requested, audience, expected) in cases {
-            assert_eq!(
-                selected(&policy, claims, requested, audience),
-                err(expected)
-            );
+        for (claims, requested, expected) in cases {
+            assert_eq!(selected(&policy, claims, requested), err(expected));
         }
     }
 
@@ -2044,27 +1845,17 @@ pub(super) mod tests {
     fn combines_several_scopes_into_one_grant() {
         let policy = with_more();
         assert_eq!(
-            scoped(&policy, claims(), &["deploy", "state"], CLOUDFLARE_AUDIENCE),
+            scoped(&policy, claims(), &["deploy", "state"]),
             ok("deploy state")
         );
         // Each once, in the order given, whatever the spacing
         assert_eq!(
-            scoped(
-                &policy,
-                claims(),
-                &["dns", "deploy", "dns"],
-                CLOUDFLARE_AUDIENCE
-            ),
+            scoped(&policy, claims(), &["dns", "deploy", "dns"]),
             ok("dns deploy")
         );
 
         let (profile, allowed_by) = parse(&policy)
-            .profiles_for(
-                "github",
-                &claims(),
-                &["deploy", "dns", "state"],
-                CLOUDFLARE_AUDIENCE,
-            )
+            .profiles_for("github", &claims(), &["deploy", "dns", "state"])
             .unwrap();
         // The token policies add up; the bucket is the one there is
         assert_eq!(profile.token.as_ref().unwrap().policies.len(), 2);
@@ -2089,11 +1880,11 @@ pub(super) mod tests {
         // `dns` and `state` take any main; `deploy` needs main in the org: all are refused
         // for a branch that isn't main, and one unknown name refuses the rest.
         assert_eq!(
-            scoped(&policy, dev, &["dns", "deploy"], CLOUDFLARE_AUDIENCE),
+            scoped(&policy, dev, &["dns", "deploy"]),
             err("scope dns doesn't match the token")
         );
         assert_eq!(
-            scoped(&policy, claims(), &["dns", "nope"], CLOUDFLARE_AUDIENCE),
+            scoped(&policy, claims(), &["dns", "nope"]),
             err("unknown scope nope")
         );
     }
@@ -2106,32 +1897,10 @@ pub(super) mod tests {
             "bucket": { "name": "org-other", "permission": "object-read-only" },
         }));
         assert_eq!(
-            scoped(
-                &policy,
-                claims(),
-                &["state", "state-two"],
-                CLOUDFLARE_AUDIENCE
-            ),
+            scoped(&policy, claims(), &["state", "state-two"]),
             err(
                 "scopes state, state-two each have a bucket, and R2 credentials are for one: ask for one of them"
             )
-        );
-
-        // The broker's own token is for one profile, so two for a service are refused
-        let mut policy = policy;
-        policy["profiles"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({ "name": "nix-pull", "audience": CACHE, "forward_claims": ["ref"] }));
-        assert_eq!(
-            scoped(&policy, claims(), &["nix-push", "nix-pull"], CACHE),
-            err(&format!(
-                "scopes nix-push, nix-pull are for {CACHE}, which takes one scope"
-            ))
-        );
-        assert_eq!(
-            scoped(&policy, claims(), &["nix-push"], CACHE),
-            ok("nix-push")
         );
     }
 
@@ -2151,7 +1920,7 @@ pub(super) mod tests {
 
         // It combines with a token, and the grant has both
         let (profile, _) = parsed
-            .profiles_for("github", &claims(), &["deploy", "nix"], CLOUDFLARE_AUDIENCE)
+            .profiles_for("github", &claims(), &["deploy", "nix"])
             .unwrap();
         assert!(profile.token.is_some() && profile.access.is_some());
 
@@ -2160,7 +1929,7 @@ pub(super) mod tests {
             json!({ "name": "nix-two", "access": { "audience": "https://other.example.com" } }),
         );
         assert_eq!(
-            scoped(&policy, claims(), &["nix", "nix-two"], CLOUDFLARE_AUDIENCE),
+            scoped(&policy, claims(), &["nix", "nix-two"]),
             err(
                 "scopes nix, nix-two each have an access, and a service token is for one application: ask for one of them"
             )
@@ -2182,25 +1951,17 @@ pub(super) mod tests {
                 "{audience}: {err}"
             );
         }
-        // An access is Cloudflare's: a profile for a service has no credentials
-        let err = parse_err(&with_profile(
-            json!({ "name": "nix", "audience": CACHE, "access": { "audience": CACHE } }),
-        ));
-        assert!(
-            err.contains("can't have a token, a bucket or an access"),
-            "{err}"
-        );
     }
 
     #[test]
     fn naming_no_scope_is_a_request_problem_and_a_bad_scope_a_scope_problem() {
         let policy = parse(&with_more());
         assert!(matches!(
-            policy.profiles_for("github", &claims(), &[], CLOUDFLARE_AUDIENCE),
+            policy.profiles_for("github", &claims(), &[]),
             Err(Refusal::Request(_))
         ));
         assert!(matches!(
-            policy.profiles_for("github", &claims(), &["nope"], CLOUDFLARE_AUDIENCE),
+            policy.profiles_for("github", &claims(), &["nope"]),
             Err(Refusal::Scope(_))
         ));
     }
@@ -2212,11 +1973,11 @@ pub(super) mod tests {
         again["name"] = json!("deploy-again");
         policy["profiles"].as_array_mut().unwrap().push(again);
         assert_eq!(
-            selected(&policy, claims(), None, CLOUDFLARE_AUDIENCE),
+            selected(&policy, claims(), None),
             err("profiles deploy, deploy-again all match the token: name one in scope")
         );
         assert_eq!(
-            selected(&policy, claims(), Some("deploy-again"), CLOUDFLARE_AUDIENCE),
+            selected(&policy, claims(), Some("deploy-again")),
             ok("deploy-again")
         );
     }
@@ -2226,11 +1987,11 @@ pub(super) mod tests {
         let mut policy = policy();
         policy["profiles"][0]["enabled"] = json!(false);
         assert_eq!(
-            selected(&policy, claims(), Some("deploy"), CLOUDFLARE_AUDIENCE),
+            selected(&policy, claims(), Some("deploy")),
             err("scope deploy is disabled")
         );
         assert_eq!(
-            selected(&policy, claims(), None, CLOUDFLARE_AUDIENCE),
+            selected(&policy, claims(), None),
             err("no profile matches the token")
         );
     }
@@ -2242,7 +2003,7 @@ pub(super) mod tests {
         policy["profiles"][0]["provider"] = json!("gitlab");
         policy["profiles"][1]["provider"] = json!("github");
         assert_eq!(
-            selected(&policy, claims(), Some("deploy"), CLOUDFLARE_AUDIENCE),
+            selected(&policy, claims(), Some("deploy")),
             err("scope deploy isn't for provider github")
         );
     }
@@ -2326,8 +2087,6 @@ pub(super) mod tests {
         let cases = [
             (json!([""]), "must not have an empty name"),
             (json!(["ref", "ref"]), "names ref twice"),
-            (json!(["iss"]), "can't copy iss: the broker's tokens set it"),
-            (json!(["profile"]), "can't copy profile"),
         ];
         for (names, expected) in cases {
             let err = parse_err(&with("/profiles/0/forward_claims", names.clone()));
@@ -2408,7 +2167,6 @@ pub(super) mod tests {
                 "com.github.actions",
                 &claims,
                 &["example-org/infra:ci.apply"],
-                CLOUDFLARE_AUDIENCE,
             )
             .unwrap();
         assert_eq!(profile.name, "example-org/infra:ci.apply");

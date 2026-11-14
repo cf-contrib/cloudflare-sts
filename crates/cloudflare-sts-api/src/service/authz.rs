@@ -7,7 +7,8 @@
 //! - **action** `Admit::Action::"<provider>"` once the token is verified, to let a
 //!   provider's tokens in at all (where the tenant is pinned), then
 //!   `Profile::Action::"<name>"`, for the profile it asks for;
-//! - **resource** `Audience::"<audience>"`, what the profile issues for;
+//! - **resource** `Audience::"https://api.cloudflare.com"`, always: what a profile
+//!   issues for. A policy can leave it unconstrained;
 //! - **context** the token's claims, each a string or a set of strings:
 //!   numbers and booleans are written as JSON writes them, so an ID is
 //!   `"100000001"` whether the issuer sent it quoted or not. Claims that are
@@ -32,6 +33,10 @@ use serde_json::{Map, Value, json};
 const ADMIT: &str = "Admit::Action";
 /// The action type for getting a profile.
 const PROFILE: &str = "Profile::Action";
+/// The one resource a request is for: Cloudflare's own credentials. It was
+/// once one of several, an audience a profile issued for, and keeps its type's
+/// name so a policy that names it still reads.
+const RESOURCE: &str = "https://api.cloudflare.com";
 
 /// A parsed Cedar policy.
 #[derive(Debug, Default)]
@@ -147,23 +152,16 @@ impl Authz {
     }
 
     /// Whether the token with `claims` may be let in by `provider`.
-    pub fn admit(&self, provider: &str, claims: &Map<String, Value>, audience: &str) -> Verdict {
-        self.decide(ADMIT, provider, claims, audience)
+    pub fn admit(&self, provider: &str, claims: &Map<String, Value>) -> Verdict {
+        self.decide(ADMIT, provider, claims)
     }
 
-    /// Whether the token with `claims` may get `profile`, issued for
-    /// `audience`.
-    pub fn profile(&self, profile: &str, claims: &Map<String, Value>, audience: &str) -> Verdict {
-        self.decide(PROFILE, profile, claims, audience)
+    /// Whether the token with `claims` may get `profile`.
+    pub fn profile(&self, profile: &str, claims: &Map<String, Value>) -> Verdict {
+        self.decide(PROFILE, profile, claims)
     }
 
-    fn decide(
-        &self,
-        kind: &str,
-        name: &str,
-        claims: &Map<String, Value>,
-        audience: &str,
-    ) -> Verdict {
+    fn decide(&self, kind: &str, name: &str, claims: &Map<String, Value>) -> Verdict {
         let denied = Verdict {
             allowed: false,
             policies: Vec::new(),
@@ -178,7 +176,7 @@ impl Authz {
         let Ok(request) = Request::new(
             uid("Caller", sub),
             uid(kind, name),
-            uid("Audience", audience),
+            uid("Audience", RESOURCE),
             context,
             None,
         ) else {
@@ -257,8 +255,6 @@ fn context(claims: &Map<String, Value>) -> Value {
 mod tests {
     use super::*;
 
-    const AUD: &str = "https://api.cloudflare.com";
-
     fn claims() -> Map<String, Value> {
         json!({
             "sub": "repo:example-org/app:ref:refs/heads/main",
@@ -296,7 +292,7 @@ mod tests {
     fn allows_what_a_permit_matches_and_names_it() {
         let authz = authz(POLICY);
         assert_eq!(
-            authz.admit("github", &claims(), AUD),
+            authz.admit("github", &claims()),
             Verdict {
                 allowed: true,
                 policies: vec!["pin".into()]
@@ -304,7 +300,7 @@ mod tests {
             "a number is compared as written, as a string"
         );
         assert_eq!(
-            authz.profile("deploy", &claims(), AUD),
+            authz.profile("deploy", &claims()),
             Verdict {
                 allowed: true,
                 policies: vec!["deploy".into()]
@@ -317,17 +313,17 @@ mod tests {
         let authz = authz(POLICY);
         let mut dev = claims();
         dev.insert("ref".into(), "refs/heads/dev".into());
-        assert!(!authz.profile("deploy", &dev, AUD).allowed);
+        assert!(!authz.profile("deploy", &dev).allowed);
         assert!(
-            !authz.profile("nope", &claims(), AUD).allowed,
+            !authz.profile("nope", &claims()).allowed,
             "an action no policy names"
         );
         let mut other = claims();
         other.insert("repository_owner_id".into(), json!("999"));
-        assert!(!authz.admit("github", &other, AUD).allowed);
+        assert!(!authz.admit("github", &other).allowed);
         other.remove("repository_owner_id");
         assert!(
-            !authz.admit("github", &other, AUD).allowed,
+            !authz.admit("github", &other).allowed,
             "a missing claim never matches"
         );
     }
@@ -338,7 +334,7 @@ mod tests {
         let mut fork = claims();
         fork.insert("fork".into(), json!(true));
         assert_eq!(
-            authz.profile("deploy", &fork, AUD),
+            authz.profile("deploy", &fork),
             Verdict {
                 allowed: false,
                 policies: vec!["no-forks".into()]
@@ -354,9 +350,9 @@ mod tests {
                @id("n") permit (principal, action == Profile::Action::"q", resource)
                when { context has actor_matrix };"#,
         );
-        assert!(authz.profile("p", &claims(), AUD).allowed);
+        assert!(authz.profile("p", &claims()).allowed);
         assert!(
-            !authz.profile("q", &claims(), AUD).allowed,
+            !authz.profile("q", &claims()).allowed,
             "an object claim isn't in the context"
         );
     }
@@ -367,7 +363,7 @@ mod tests {
             r#"@id("bad") permit (principal, action == Profile::Action::"p", resource)
                when { context.repository.contains("x") };"#,
         );
-        assert!(!authz.profile("p", &claims(), AUD).allowed);
+        assert!(!authz.profile("p", &claims()).allowed);
     }
 
     #[test]

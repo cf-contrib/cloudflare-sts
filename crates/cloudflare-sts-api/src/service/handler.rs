@@ -36,20 +36,18 @@ use cloudflare::v4::{
 };
 use cloudflare_sts_sdk::v1::{
     self, AccessCredentials, AuthorizationServerMetadata, BucketCredentials, DiscoveryServiceApi,
-    Error, ErrorCode, IdentityProvider, IssuedTokenType, Jwks, OpenIdProviderMetadata,
-    TokenExchangeRequest, TokenExchangeRequestSubjectTokenType as SubjectTokenType,
-    TokenExchangeResponse, TokenExchangeResponseTokenType as TokenType, TokenRevocationRequest,
+    Error, ErrorCode, IssuedTokenType, TokenExchangeRequest,
+    TokenExchangeRequestSubjectTokenType as SubjectTokenType, TokenExchangeResponse,
+    TokenExchangeResponseTokenType as TokenType, TokenRevocationRequest,
     TokenRevocationRequestTokenTypeHint, TokenServiceApi,
 };
-use serde_json::json;
 use tracing::{error, info, warn};
 use worker::{Date, send::SendFuture};
 
 use super::config::{
-    AccessConfig, BucketPermission, CLOUDFLARE_AUDIENCE, Config, ProfileConfig, ProviderConfig,
-    Refusal,
+    AccessConfig, BucketPermission, Config, ProfileConfig, ProviderConfig, Refusal,
 };
-use crate::oidc::{self, AccessTokenClaims, Jwt, SigningKey};
+use crate::oidc::{self, Jwt};
 
 /// The token exchange grant, RFC 8693's.
 pub(super) const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -63,20 +61,6 @@ const NAME_MAX: usize = 120;
 
 /// Tokens listed per page by the cleanup.
 const PAGE_SIZE: usize = 50;
-
-/// The signing key, read now, or `None` if none is bound: what the broker
-/// signs its own tokens with, and publishes the public half of.
-pub(super) async fn signing_key(config: &Config) -> Result<Option<SigningKey>, Error> {
-    let misconfigured = |why: String| Error::new(ErrorCode::ServerError, why);
-    match config.signing_key().await {
-        Ok(Some(pem)) => SigningKey::import(&pem)
-            .await
-            .map(Some)
-            .map_err(|err| misconfigured(format!("the signing key: {err}"))),
-        Ok(None) => Ok(None),
-        Err(err) => Err(misconfigured(err.to_string())),
-    }
-}
 
 /// The token endpoints, over the Worker's configuration.
 #[derive(Clone)]
@@ -189,55 +173,6 @@ impl TokenServiceHandler {
             }
         }
         Ok(deleted)
-    }
-
-    /// The broker's own token, for a profile with another service's `audience`.
-    async fn service_token(
-        &self,
-        identity: &Jwt,
-        provider: &ProviderConfig,
-        profile: &ProfileConfig,
-        ttl: u64,
-        issued_token_type: IssuedTokenType,
-    ) -> Result<TokenExchangeResponse, Error> {
-        let Some(key) = signing_key(&self.config).await? else {
-            return Err(Error::new(
-                ErrorCode::ServerError,
-                format!(
-                    "a token for {} needs a signing key, and none is bound",
-                    profile.audience
-                ),
-            ));
-        };
-        let now = Date::now().as_millis() / 1000;
-        let issuer = &self.config.policy().issuer;
-        let (claims, expires_at) = payload(issuer, identity, provider, profile, ttl, now)?;
-        let signed = key
-            .sign_access_token(claims)
-            .await
-            .map_err(|err| Error::new(ErrorCode::ServerError, format!("signing a token: {err}")))?;
-        info!(
-            event = "token.issue",
-            provider = %provider.name,
-            profile = %profile.name,
-            sub = identity.claims.sub(),
-            claims = %serde_json::Value::Object(profile.forwarded_claims(&identity.claims)),
-            audience = %profile.audience,
-            jti = %signed.jti,
-            expires_at,
-        );
-        Ok(TokenExchangeResponse {
-            access: None,
-            access_token: Some(signed.jwt),
-            account_id: None,
-            bucket: None,
-            expires_at: expires_at as i64,
-            expires_in: expires_at.saturating_sub(now) as i64,
-            issued_token_type,
-            scope: profile.name.clone(),
-            token_id: None,
-            token_type: TokenType::Bearer,
-        })
     }
 
     /// A Cloudflare API token, R2 credentials, or both, as the profile has
@@ -515,52 +450,6 @@ impl TokenServiceApi for TokenServiceHandler {
             let mut caller: Option<(Jwt, &ProviderConfig)> = None;
             let mut named: Option<ProfileConfig> = None;
             let exchanged = async {
-                // What the generated validation can't check: the audience,
-                // and whether what's asked for can be issued for it.
-                // Cloudflare's gets Cloudflare credentials; any other, a
-                // JWT.
-                let invalid = |code, description: String| Err(Error::new(code, description));
-                let audience = request.audience.as_deref().unwrap_or(CLOUDFLARE_AUDIENCE);
-                if audience.is_empty() {
-                    return invalid(
-                        ErrorCode::InvalidRequest,
-                        "audience must not be empty".into(),
-                    );
-                }
-                let shown: String = audience.chars().take(200).collect();
-                let issuable = match (
-                    audience == CLOUDFLARE_AUDIENCE,
-                    &request.requested_token_type,
-                ) {
-                    (_, None) => true,
-                    (true, Some(t)) => matches!(
-                        t,
-                        IssuedTokenType::UrnIetfParamsOauthTokenTypeAccessToken
-                            | IssuedTokenType::UrnCloudflareStsParamsOauthTokenTypeR2Credentials
-                            | IssuedTokenType::UrnCloudflareStsParamsOauthTokenTypeAccessServiceToken
-                    ),
-                    (false, Some(t)) => matches!(
-                        t,
-                        IssuedTokenType::UrnIetfParamsOauthTokenTypeJwt
-                            | IssuedTokenType::UrnIetfParamsOauthTokenTypeAccessToken
-                    ),
-                };
-                // What the broker won't issue for the audience is RFC 8693's
-                // invalid_target.
-                if let (false, Some(requested)) = (issuable, &request.requested_token_type) {
-                    return invalid(
-                        ErrorCode::InvalidTarget,
-                        format!("{requested} can't be issued for {shown}"),
-                    );
-                }
-                if audience != CLOUDFLARE_AUDIENCE
-                    && !policy.profiles.iter().any(|p| p.audience == audience)
-                {
-                    return invalid(
-                        ErrorCode::InvalidTarget,
-                        format!("no profile is for audience {shown}"),
-                    );
-                }
                 // `id_token` and `jwt` alike: an OIDC token is a JWT.
                 let (SubjectTokenType::UrnIetfParamsOauthTokenTypeIdToken
                 | SubjectTokenType::UrnIetfParamsOauthTokenTypeJwt) = request.subject_token_type;
@@ -584,7 +473,7 @@ impl TokenServiceApi for TokenServiceHandler {
                     .split_whitespace()
                     .collect();
                 let (profile, allowed_by) = policy
-                    .profiles_for(&provider.name, &identity.claims, &scopes, audience)
+                    .profiles_for(&provider.name, &identity.claims, &scopes)
                     .map_err(|refusal| match refusal {
                         Refusal::Scope(why) => Error::new(ErrorCode::InvalidScope, why),
                         Refusal::Request(why) => invalid_request(&why),
@@ -600,20 +489,8 @@ impl TokenServiceApi for TokenServiceHandler {
                 let ttl = profile
                     .ttl_for(request.ttl.as_deref())
                     .map_err(|why| invalid_request(&why))?;
-                if profile.audience == CLOUDFLARE_AUDIENCE {
-                    self.cloudflare_credentials(identity, provider, profile, ttl)
-                        .await
-                } else {
-                    // An access token is a JWT: named as asked for.
-                    let issued_token_type = match request.requested_token_type {
-                        Some(IssuedTokenType::UrnIetfParamsOauthTokenTypeJwt) => {
-                            IssuedTokenType::UrnIetfParamsOauthTokenTypeJwt
-                        }
-                        _ => IssuedTokenType::UrnIetfParamsOauthTokenTypeAccessToken,
-                    };
-                    self.service_token(identity, provider, profile, ttl, issued_token_type)
-                        .await
-                }
+                self.cloudflare_credentials(identity, provider, profile, ttl)
+                    .await
             };
 
             match exchanged.await {
@@ -797,19 +674,16 @@ impl DiscoveryServiceHandler {
 #[async_trait::async_trait]
 impl DiscoveryServiceApi for DiscoveryServiceHandler {
     /// `GET /.well-known/oauth-authorization-server`: the broker's
-    /// Authorization Server Metadata (RFC 8414), so services can find its keys
-    /// and endpoints. It issues tokens by exchange only, so there's no
-    /// authorization endpoint. With providers people sign in with, it also
-    /// says which, so a client needs only the broker's URL.
+    /// Authorization Server Metadata (RFC 8414), so clients can find its
+    /// endpoints. It issues by exchange only, so there's no authorization
+    /// endpoint.
     async fn metadata(&self) -> v1::MetadataResponse {
         let policy = self.config.policy();
         let issuer = &policy.issuer;
         let url = |path: &str| format!("{issuer}{path}").parse();
-        let (Ok(jwks_uri), Ok(token_endpoint), Ok(revocation_endpoint)) = (
-            url("/.well-known/jwks"),
-            url("/oauth/token"),
-            url("/oauth/revoke"),
-        ) else {
+        let (Ok(token_endpoint), Ok(revocation_endpoint)) =
+            (url("/oauth/token"), url("/oauth/revoke"))
+        else {
             error!(%issuer, "the issuer makes no URLs");
             return v1::MetadataResponse::InternalServerError(Error::new(
                 ErrorCode::ServerError,
@@ -818,75 +692,13 @@ impl DiscoveryServiceApi for DiscoveryServiceHandler {
         };
         v1::MetadataResponse::Ok(AuthorizationServerMetadata {
             issuer: issuer.clone(),
-            jwks_uri,
             token_endpoint,
             revocation_endpoint,
             response_types_supported: vec![],
             grant_types_supported: vec![TOKEN_EXCHANGE.into()],
             token_endpoint_auth_methods_supported: Some(vec!["none".into()]),
             revocation_endpoint_auth_methods_supported: Some(vec!["none".into()]),
-            identity_providers: Some(
-                policy
-                    .identity_providers()
-                    .map(|provider| IdentityProvider {
-                        name: provider.name.clone(),
-                        issuer: provider.issuer.clone(),
-                        client_id: provider.client_id.clone().unwrap_or_default(),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .filter(|providers| !providers.is_empty()),
         })
-    }
-
-    /// `GET /.well-known/openid-configuration`: the broker's OpenID Provider
-    /// Metadata (OpenID Connect Discovery 1.0), for services that find an
-    /// issuer's keys only that way, such as AWS IAM. There's no authorization
-    /// endpoint, as for GitHub's and Kubernetes' issuers; the rest is what
-    /// Discovery requires.
-    async fn openid_configuration(&self) -> v1::OpenidConfigurationResponse {
-        let issuer = &self.config.policy().issuer;
-        let Ok(jwks_uri) = format!("{issuer}/.well-known/jwks").parse() else {
-            error!(%issuer, "the issuer makes no URLs");
-            return v1::OpenidConfigurationResponse::InternalServerError(Error::new(
-                ErrorCode::ServerError,
-                "the broker is misconfigured; its logs say why",
-            ));
-        };
-        v1::OpenidConfigurationResponse::Ok(OpenIdProviderMetadata {
-            issuer: issuer.clone(),
-            jwks_uri,
-            response_types_supported: vec!["id_token".into()],
-            subject_types_supported: vec!["public".into()],
-            id_token_signing_alg_values_supported: vec!["RS256".into()],
-        })
-    }
-
-    /// `GET /.well-known/jwks`: the broker's public key, or none when no
-    /// signing key is bound.
-    async fn jwks(&self) -> v1::JwksResponse {
-        SendFuture::new(async move {
-            let keys = async {
-                let Some(key) = signing_key(&self.config).await? else {
-                    return Ok(Jwks { keys: vec![] });
-                };
-                let jwk = serde_json::from_value(key.public_jwk()).map_err(|err| {
-                    Error::new(ErrorCode::ServerError, format!("the public key: {err}"))
-                })?;
-                Ok::<_, Error>(Jwks { keys: vec![jwk] })
-            };
-            match keys.await {
-                Ok(jwks) => v1::JwksResponse::Ok(jwks),
-                Err(err) => {
-                    error!(error = err.error.as_str(), message = %err.error_description);
-                    v1::JwksResponse::InternalServerError(Error::new(
-                        err.error,
-                        "the broker failed; its logs say why",
-                    ))
-                }
-            }
-        })
-        .await
     }
 }
 
@@ -939,65 +751,12 @@ fn missing(what: &str) -> Error {
     )
 }
 
-/// The claims of an access token for another service (RFC 9068), issued at
-/// `now` (seconds since the epoch), and when it expires. It never outlives the
-/// token the caller presented. Its `client_id` is the provider's name: the
-/// caller doesn't authenticate as a client, and it's the provider that says
-/// who it is.
-///
-/// It has the claims the profile forwards, under the issuer's names, so the
-/// service can match on them. Nothing else: an issuer's other claims,
-/// such as an email, stay behind. Signing adds its `jti`.
-fn payload(
-    issuer: &str,
-    identity: &Jwt,
-    provider: &ProviderConfig,
-    profile: &ProfileConfig,
-    ttl: u64,
-    now: u64,
-) -> Result<(AccessTokenClaims, u64), Error> {
-    let claims = &identity.claims;
-    let not_after = claims.exp().unwrap_or(u64::MAX);
-    let expires_at = (now + ttl / 1000).min(not_after);
-    // The caller's token was accepted with clock tolerance; a token that can't
-    // live at all isn't issued.
-    if expires_at <= now {
-        return Err(Error::new(
-            ErrorCode::InvalidRequest,
-            "the subject token has expired",
-        ));
-    }
-
-    let mut other = profile.forwarded_claims(claims);
-    for (name, value) in [
-        ("provider", json!(provider.name)),
-        ("profile", json!(profile.name)),
-        ("nbf", json!(now)),
-    ] {
-        other.insert(name.into(), value);
-    }
-    let sub = match identity.claims.sub() {
-        Some(sub) => sub.to_string(),
-        None => format!("{}:unknown", provider.name),
-    };
-    let payload = AccessTokenClaims {
-        iss: issuer.to_string(),
-        sub,
-        aud: profile.audience.clone(),
-        client_id: provider.name.clone(),
-        iat: now,
-        exp: expires_at,
-        other,
-    };
-    Ok((payload, expires_at))
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Map, Value};
 
     use super::*;
-    use crate::service::config::tests::{CACHE, NOW, claims, parse, policy};
+    use crate::service::config::tests::{claims, parse, policy};
 
     fn identity(claims: Map<String, Value>) -> Jwt {
         Jwt {
@@ -1024,52 +783,5 @@ mod tests {
         let name = token_name(provider, &identity(long));
         assert_eq!(name.chars().count(), 120);
         assert!(name.starts_with("cloudflare-sts:github:xxx"));
-    }
-
-    #[test]
-    fn copies_only_the_claims_the_profile_forwards() {
-        let policy = parse(&policy());
-        let (provider, profile) = (&policy.providers[0], &policy.profiles[1]);
-        let mut matched = claims();
-        matched.insert("email".into(), "someone@example.com".into());
-        let (issued, expires_at) = payload(
-            "https://cloudflare-sts-api.example.com",
-            &identity(matched),
-            provider,
-            profile,
-            15 * 60_000,
-            NOW,
-        )
-        .unwrap();
-        assert_eq!(expires_at, NOW + 300, "never past the caller's own token");
-        assert_eq!(
-            Value::Object(oidc::Claims::from(issued).into_inner()),
-            json!({
-                "ref": "refs/heads/main",
-                "repository_owner_id": "100000001",
-                "provider": "github",
-                "profile": "nix-push",
-                "iss": "https://cloudflare-sts-api.example.com",
-                "aud": CACHE,
-                "sub": "repo:example-org/app:ref:refs/heads/main",
-                "client_id": "github",
-                "iat": NOW,
-                "nbf": NOW,
-                "exp": NOW + 300,
-            })
-        );
-
-        let mut expired = claims();
-        expired.insert("exp".into(), json!(NOW));
-        let err = payload(
-            "https://x.example.com",
-            &identity(expired),
-            provider,
-            profile,
-            60_000,
-            NOW,
-        )
-        .unwrap_err();
-        assert_eq!(err.error_description, "the subject token has expired");
     }
 }

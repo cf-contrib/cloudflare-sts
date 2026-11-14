@@ -2,15 +2,15 @@
 //! JOSE [`Header`] and JWT [`Claims`], and decoding one as it was sent.
 
 mod claims;
-mod header;
+mod headers;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Map, Value};
 
 pub(crate) use self::claims::LEEWAY_SECS;
 pub use self::{
-    claims::{AccessTokenClaims, Claims},
-    header::{ALGORITHM, AT_JWT, Header},
+    claims::Claims,
+    headers::{ALGORITHM, Header},
 };
 use crate::oidc::{Error, error::invalid};
 

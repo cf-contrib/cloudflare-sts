@@ -171,46 +171,6 @@ impl From<Claims> for Map<String, Value> {
     }
 }
 
-/// The claims of a JWT access token (RFC 9068 §2.2): the ones it requires,
-/// so a token without them can't be signed, and any others.
-/// [`SigningKey::sign_access_token`](crate::oidc::SigningKey::sign_access_token)
-/// signs them, and gives them their `jti`.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct AccessTokenClaims {
-    /// `iss`: the issuer signing it.
-    pub iss: String,
-    /// `sub`: whom it's about.
-    pub sub: String,
-    /// `aud`: the resource it's for.
-    pub aud: String,
-    /// `client_id`: the client it's issued to.
-    pub client_id: String,
-    /// `iat`: when it's issued, in seconds since the epoch.
-    pub iat: u64,
-    /// `exp`: when it expires, in seconds since the epoch.
-    pub exp: u64,
-    /// Any other claims. The ones above take their place if they're here
-    /// too, as does the `jti` signing gives it.
-    pub other: Map<String, Value>,
-}
-
-impl From<AccessTokenClaims> for Claims {
-    fn from(token: AccessTokenClaims) -> Self {
-        let mut claims = token.other;
-        for (name, value) in [
-            ("iss", Value::from(token.iss)),
-            ("sub", Value::from(token.sub)),
-            ("aud", Value::from(token.aud)),
-            ("client_id", Value::from(token.client_id)),
-            ("iat", Value::from(token.iat)),
-            ("exp", Value::from(token.exp)),
-        ] {
-            claims.insert(name.to_string(), value);
-        }
-        Self(claims)
-    }
-}
-
 /// A NumericDate (RFC 7519 §2): seconds since the epoch, which may have a
 /// fraction. Never negative here.
 fn numeric_date(value: &Value) -> Option<f64> {
@@ -282,34 +242,6 @@ mod tests {
         assert_eq!(
             claims.scope().collect::<Vec<_>>(),
             ["cache:read", "cache:write"]
-        );
-    }
-
-    #[test]
-    fn access_token_claims_hold_what_rfc_9068_requires() {
-        let mut other = Map::new();
-        other.insert("iss".into(), json!("https://forged.example.com"));
-        other.insert("profile".into(), json!("nix-push"));
-        let claims = Claims::from(AccessTokenClaims {
-            iss: ISSUER.into(),
-            sub: "repo:example-org/app".into(),
-            aud: AUDIENCE.into(),
-            client_id: "github".into(),
-            iat: NOW,
-            exp: NOW + 300,
-            other,
-        });
-        assert_eq!(
-            Value::Object(claims.into_inner()),
-            json!({
-                "iss": ISSUER,
-                "sub": "repo:example-org/app",
-                "aud": AUDIENCE,
-                "client_id": "github",
-                "iat": NOW,
-                "exp": NOW + 300,
-                "profile": "nix-push",
-            })
         );
     }
 

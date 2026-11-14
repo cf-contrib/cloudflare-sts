@@ -111,31 +111,6 @@ run "secrets_store_binding" {
   }
 }
 
-run "no_signing_key_by_default" {
-  command = plan
-
-  assert {
-    condition     = length([for b in cloudflare_worker_version.this.bindings : b if b.name == "CLOUDFLARE_STS_API_SIGNING_KEY"]) == 0
-    error_message = "the signing key should only be bound when signing_key_secret is set"
-  }
-}
-
-run "signing_key_binding" {
-  command = plan
-
-  variables {
-    signing_key_secret = { secret_store_id = "00000000000000000000000000000000", secret_name = "cloudflare-sts-signing-key" }
-  }
-
-  assert {
-    condition = anytrue([
-      for b in cloudflare_worker_version.this.bindings :
-      b.name == "CLOUDFLARE_STS_API_SIGNING_KEY" && b.type == "secrets_store_secret" && b.secret_name == "cloudflare-sts-signing-key"
-    ])
-    error_message = "the signing key should be a Secrets Store binding"
-  }
-}
-
 run "policy_is_built_from_the_variables" {
   command = plan
 
@@ -163,37 +138,9 @@ run "policy_is_built_from_the_variables" {
   }
 
   assert {
-    condition     = !contains(keys(jsondecode(local.config_json).providers[0]), "jwks_uri") && !contains(keys(jsondecode(local.config_json).providers[0]), "typ") && !contains(keys(jsondecode(local.config_json)), "defaults") && !contains(keys(jsondecode(local.config_json).providers[0]), "client_id")
+    condition     = !contains(keys(jsondecode(local.config_json).providers[0]), "jwks_uri") && !contains(keys(jsondecode(local.config_json).providers[0]), "typ") && !contains(keys(jsondecode(local.config_json)), "defaults")
     error_message = "unset fields should be left out, not null: the broker refuses a null"
   }
-}
-
-run "takes_a_client_id_as_the_audience" {
-  command = plan
-
-  variables {
-    oidc_providers = [
-      { name = "github", issuer = "https://token.actions.githubusercontent.com" },
-      { name = "access", issuer = "https://example.cloudflareaccess.com/cdn-cgi/access/sso/oidc/abc", client_id = "abc" },
-    ]
-  }
-
-  assert {
-    condition     = jsondecode(local.config_json).providers[1].client_id == "abc" && jsondecode(local.config_json).providers[1].audience == "abc"
-    error_message = "a client_id should reach the policy, as the provider's audience too"
-  }
-}
-
-run "rejects_a_client_id_that_isnt_the_audience" {
-  command = plan
-
-  variables {
-    oidc_providers = [
-      { name = "access", issuer = "https://example.cloudflareaccess.com", audience = "https://cloudflare-sts-api.example.com", client_id = "abc" },
-    ]
-  }
-
-  expect_failures = [var.oidc_providers]
 }
 
 run "takes_a_providers_own_audience_jwks_uri_typ_and_defaults" {

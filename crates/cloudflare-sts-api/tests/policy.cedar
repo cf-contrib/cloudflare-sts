@@ -92,24 +92,16 @@ when { context.environment == "combo" };
 permit (principal, action == Profile::Action::"combo-access-two", resource)
 when { context.environment == "combo" };
 
-@id("allow-nix-push")
-permit (principal, action == Profile::Action::"nix-push", resource)
-when { context.ref == "refs/heads/main" };
-
 @id("allow-gitlab-deploy")
 permit (principal, action == Profile::Action::"gitlab-deploy", resource)
 when { context.project_path == "group/app" && context.ref_protected == "true" };
-
-@id("allow-gitlab-cache")
-permit (principal, action == Profile::Action::"gitlab-cache", resource)
-when { context.project_path like "group/*" };
 
 @id("allow-gitlab-state")
 permit (principal, action == Profile::Action::"gitlab-state", resource)
 when { context.project_path like "group/sub/*" };
 
-@id("allow-pinned-cache")
-permit (principal, action == Profile::Action::"pinned-cache", resource)
+@id("allow-pinned-state")
+permit (principal, action == Profile::Action::"pinned-state", resource)
 when { context.namespace_id == "4000001" };
 
 @id("allow-example-org/app:tofu-plan")

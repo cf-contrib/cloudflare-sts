@@ -53,7 +53,7 @@ pub trait Provider {
     }
 
     /// The `typ` its tokens must have (RFC 8725 §3.11), such as
-    /// [`AT_JWT`](crate::oidc::AT_JWT), so another kind of token it issues can't
+    /// `at+jwt`, so another kind of token it issues can't
     /// pass for one. `None`, the default, takes any.
     fn typ(&self) -> Option<&str> {
         None

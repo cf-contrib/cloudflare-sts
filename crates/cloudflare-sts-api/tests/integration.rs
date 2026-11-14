@@ -585,7 +585,7 @@ mod exchange_requests {
     }
 
     #[tokio::test]
-    async fn accepts_the_jwt_token_type_and_the_cloudflare_audience() {
+    async fn accepts_the_jwt_subject_token_type() {
         let _t = start().await;
         let jwt = sign(github_claims(json!({})));
         let res = post_form(
@@ -594,7 +594,6 @@ mod exchange_requests {
                 ("grant_type", GRANT),
                 ("subject_token", &jwt),
                 ("subject_token_type", JWT_TYPE),
-                ("audience", "https://api.cloudflare.com"),
             ],
         )
         .await;
@@ -605,7 +604,7 @@ mod exchange_requests {
     #[tokio::test]
     async fn rejects_what_it_doesnt_support_without_calling_anyone() {
         type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str, &'a str);
-        let cases: [Case; 9] = [
+        let cases: [Case; 8] = [
             (
                 "another grant type",
                 &[("grant_type", "client_credentials")],
@@ -637,11 +636,12 @@ mod exchange_requests {
                 "invalid_request",
                 "",
             ),
+            // The broker issues Cloudflare's credentials only: no audience to ask for.
             (
-                "another audience",
+                "an audience",
                 &[("audience", "https://cache.example.com")],
-                "invalid_target",
-                "no profile is for audience",
+                "invalid_request",
+                "",
             ),
             (
                 "an actor token",
@@ -650,14 +650,8 @@ mod exchange_requests {
                 "",
             ),
             (
-                "a JWT for Cloudflare",
+                "a JWT as the requested token type",
                 &[("requested_token_type", JWT_TYPE)],
-                "invalid_target",
-                "can't be issued for https://api.cloudflare.com",
-            ),
-            (
-                "an empty audience",
-                &[("audience", "")],
                 "invalid_request",
                 "",
             ),
@@ -747,15 +741,13 @@ mod people {
     }
 
     #[tokio::test]
-    async fn the_metadata_says_where_people_sign_in() {
+    async fn the_metadata_names_no_identity_providers() {
         let _t = start().await;
         let res = call(Method::GET, "/.well-known/oauth-authorization-server").await;
         assert_eq!(res.status, 200);
-        // Only the providers with a client ID: not GitHub Actions or GitLab.
-        assert_eq!(
-            res.json()["identity_providers"],
-            json!([{ "name": "access", "issuer": issuer("access"), "client_id": CLIENT_ID }])
-        );
+        // Sign-in is the client's: cf-vault is told the provider and client
+        // in its own profile, so the broker has none to list.
+        assert!(res.json().get("identity_providers").is_none());
     }
 
     #[tokio::test]
@@ -827,8 +819,8 @@ mod providers {
         claims
     }
 
-    /// A test with the GitLab stand-in, whose profiles are `gitlab-deploy`,
-    /// `gitlab-cache` and `gitlab-state`.
+    /// A test with the GitLab stand-in, whose profiles are `gitlab-deploy`
+    /// and `gitlab-state`.
     async fn setup() -> (Test, String) {
         (start().await, issuer("gitlab"))
     }
@@ -928,16 +920,16 @@ mod providers {
         let _t = start().await;
         // Its discovery document names another issuer; jwks_uri never reads it.
         let pinned = gitlab_token(&issuer("pinned"), gitlab_claims(json!({})));
-        let res = job_token(&pinned, &[("audience", CACHE)]).await;
+        let res = job_token(&pinned, &[]).await;
         assert_eq!(res.status, 200, "{}", res.text);
-        assert_eq!(res.json()["scope"], "pinned-cache");
+        assert_eq!(res.json()["scope"], "pinned-state");
     }
 
     #[tokio::test]
     async fn refuses_a_token_without_the_typ_its_provider_names() {
         let t = start().await;
         let typed = gitlab_token(&issuer("typed"), gitlab_claims(json!({})));
-        let res = job_token(&typed, &[("audience", CACHE)]).await;
+        let res = job_token(&typed, &[]).await;
         assert_eq!(res.status, 400, "{}", res.text);
         assert_refused(
             &t.deny().await,
@@ -958,210 +950,6 @@ mod providers {
             res.json()["bucket"]["prefixes"],
             json!(["gitlab.com/group/sub/app/", "4000001/500000001/"])
         );
-    }
-
-    #[tokio::test]
-    async fn issues_another_providers_caller_a_service_token_with_the_matched_claims() {
-        let (_t, gitlab) = setup().await;
-        let res = job_token(
-            &gitlab_token(&gitlab, gitlab_claims(json!({}))),
-            &[("audience", CACHE)],
-        )
-        .await;
-        assert_eq!(res.status, 200, "{}", res.text);
-        let (_, claims) = verify_broker_token(res.json()["access_token"].as_str().unwrap()).await;
-        assert_matches(
-            &claims,
-            json!({
-                "iss": AUDIENCE,
-                "aud": CACHE,
-                "sub": "project_path:group/app:ref_type:branch:ref:main",
-                "provider": "gitlab",
-                "profile": "gitlab-cache",
-                // What the profile forwards, so the service can match on it too.
-                "project_path": "group/app",
-                "namespace_id": "4000001",
-            }),
-        );
-        // Claims the profile doesn't forward stay behind.
-        assert!(claims.get("project_id").is_none());
-    }
-}
-
-mod tokens_for_other_services {
-    use super::*;
-
-    /// A test of the `nix-push` profile, for the cache.
-    async fn setup() -> Test {
-        start().await
-    }
-
-    async fn for_cache(subject_token: &str, token_type: &str, extra: &[(&str, &str)]) -> Reply {
-        let mut form = vec![
-            ("grant_type", GRANT),
-            ("subject_token", subject_token),
-            ("subject_token_type", token_type),
-            ("audience", CACHE),
-        ];
-        form.extend_from_slice(extra);
-        post_form("/oauth/token", &form).await
-    }
-
-    #[tokio::test]
-    async fn issues_a_job_a_token_the_service_can_verify_with_the_brokers_keys() {
-        let t = setup().await;
-        let sub = "repo:example-org/api:environment:prod";
-        let res = for_cache(&sign(github_claims(json!({ "sub": sub }))), ID_TOKEN, &[]).await;
-        assert_eq!(res.status, 200, "{}", res.text);
-        let body = res.json();
-        assert_eq!(
-            body,
-            json!({
-                "access_token": body["access_token"],
-                "issued_token_type": ACCESS_TOKEN,
-                "token_type": "Bearer",
-                "expires_in": body["expires_in"],
-                "expires_at": body["expires_at"],
-                "scope": "nix-push",
-            })
-        );
-        let (header, claims) = verify_broker_token(body["access_token"].as_str().unwrap()).await;
-        // An RFC 9068 access token.
-        assert_matches(&header, json!({ "alg": "RS256", "typ": "at+jwt" }));
-        assert_matches(
-            &claims,
-            json!({
-                "iss": AUDIENCE,
-                "aud": CACHE,
-                "sub": sub,
-                "client_id": "github",
-                "provider": "github",
-                "profile": "nix-push",
-                // What the profile forwards, so the service can match on it too.
-                "repository_owner_id": OWNER_ID,
-                "ref": "refs/heads/main",
-            }),
-        );
-        // Nothing else of the job's token.
-        assert!(
-            claims.get("repository").is_none() && claims.get("run_id").is_none(),
-            "{claims}"
-        );
-        assert!(claims["jti"].is_string() && claims["iat"].is_u64());
-        // Only the identity: no API token, no R2 credentials.
-        assert!(world().cloudflare.calls().is_empty());
-        assert_matches(
-            &t.audit("token.issue").await.unwrap(),
-            json!({ "provider": "github", "profile": "nix-push", "audience": CACHE, "jti": claims["jti"] }),
-        );
-    }
-
-    #[tokio::test]
-    async fn never_outlives_the_jobs_oidc_token() {
-        let _t = setup().await;
-        let before = now();
-        let jwt = sign_with(&issuer("actions"), github_claims(json!({})), AUDIENCE, 120);
-        let body = for_cache(&jwt, ID_TOKEN, &[]).await.json();
-        // The profile's ttl is 15m; the GitHub token's 2m wins.
-        let lives = body["expires_at"].as_u64().unwrap() - before;
-        assert!(lives > 60 && lives <= 2 * 60 + 1, "{lives}");
-    }
-
-    #[tokio::test]
-    async fn publishes_its_metadata_and_only_the_public_key() {
-        let _t = setup().await;
-        let res = call(Method::GET, "/.well-known/oauth-authorization-server").await;
-        assert_eq!(res.status, 200);
-        assert_eq!(res.cache_control.as_deref(), Some("public, max-age=300"));
-        assert_matches(
-            &res.json(),
-            json!({
-                "issuer": AUDIENCE,
-                "jwks_uri": format!("{AUDIENCE}/.well-known/jwks"),
-                "token_endpoint": format!("{AUDIENCE}/oauth/token"),
-                "revocation_endpoint": format!("{AUDIENCE}/oauth/revoke"),
-                "response_types_supported": [],
-                "grant_types_supported": [GRANT],
-            }),
-        );
-
-        // The same issuer and keys, for services that only read OpenID
-        // Connect Discovery.
-        let res = call(Method::GET, "/.well-known/openid-configuration").await;
-        assert_eq!(res.status, 200);
-        assert_eq!(res.cache_control.as_deref(), Some("public, max-age=300"));
-        assert_matches(
-            &res.json(),
-            json!({
-                "issuer": AUDIENCE,
-                "jwks_uri": format!("{AUDIENCE}/.well-known/jwks"),
-                "response_types_supported": ["id_token"],
-                "subject_types_supported": ["public"],
-                "id_token_signing_alg_values_supported": ["RS256"],
-            }),
-        );
-
-        let jwks = call(Method::GET, "/.well-known/jwks").await.json();
-        let keys = jwks["keys"].as_array().unwrap();
-        assert_eq!(keys.len(), 1);
-        // Only the public members: no d, p, q or the CRT values.
-        let mut members: Vec<&String> = keys[0].as_object().unwrap().keys().collect();
-        members.sort();
-        assert_eq!(members, ["alg", "e", "kid", "kty", "n", "use"]);
-        let res = for_cache(&sign(github_claims(json!({}))), ID_TOKEN, &[]).await;
-        let (header, _) = verify_broker_token(res.json()["access_token"].as_str().unwrap()).await;
-        assert_eq!(header["kid"], keys[0]["kid"]);
-    }
-
-    #[tokio::test]
-    async fn rejects_an_audience_no_profile_is_for() {
-        let t = setup().await;
-        let jwt = sign(github_claims(json!({})));
-        let res = post_form(
-            "/oauth/token",
-            &[
-                ("grant_type", GRANT),
-                ("subject_token", &jwt),
-                ("subject_token_type", ID_TOKEN),
-                ("audience", "https://other.example.com"),
-            ],
-        )
-        .await;
-        assert_eq!(res.status, 400);
-        assert_refused(
-            &t.deny().await,
-            "invalid_target",
-            "no profile is for audience",
-        );
-    }
-
-    #[tokio::test]
-    async fn refuses_a_cloudflare_profile_named_for_the_service() {
-        let t = setup().await;
-        let res = for_cache(
-            &sign(github_claims(json!({}))),
-            ID_TOKEN,
-            &[("scope", "workers-deploy")],
-        )
-        .await;
-        assert_eq!(res.status, 400);
-        assert_refused(
-            &t.deny().await,
-            "invalid_scope",
-            &format!("scope workers-deploy isn't for {CACHE}"),
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_a_cloudflare_token_type_requested_for_the_service() {
-        let _t = setup().await;
-        let res = for_cache(
-            &sign(github_claims(json!({}))),
-            ID_TOKEN,
-            &[("requested_token_type", R2_CREDENTIALS)],
-        )
-        .await;
-        assert_eq!(res.status, 400);
     }
 }
 

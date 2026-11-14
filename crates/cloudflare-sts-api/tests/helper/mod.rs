@@ -20,10 +20,10 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng};
 use rsa::{
-    BigUint, RsaPrivateKey, RsaPublicKey,
-    pkcs1v15::{Signature, SigningKey, VerifyingKey},
+    RsaPrivateKey,
+    pkcs1v15::SigningKey,
     sha2::Sha256,
-    signature::{SignatureEncoding, Signer, Verifier},
+    signature::{SignatureEncoding, Signer},
     traits::PublicKeyParts,
 };
 use serde_json::{Map, Value, json};
@@ -367,34 +367,6 @@ pub async fn revoke_access(id: &str) -> Reply {
         ],
     )
     .await
-}
-
-/// Verifies a token the broker signed with the keys it publishes, and returns
-/// its header and claims.
-pub async fn verify_broker_token(jwt: &str) -> (Value, Value) {
-    let jwks = call(Method::GET, "/.well-known/jwks").await.json();
-    let [header, payload, signature] = jwt.split('.').collect::<Vec<_>>()[..] else {
-        panic!("not a JWT: {jwt}");
-    };
-    let decode =
-        |s: &str| -> Value { serde_json::from_slice(&URL_SAFE_NO_PAD.decode(s).unwrap()).unwrap() };
-    let (header_json, claims) = (decode(header), decode(payload));
-    let key = jwks["keys"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|k| k["kid"] == header_json["kid"])
-        .expect("the token's kid is published");
-    let number = |name: &str| {
-        BigUint::from_bytes_be(&URL_SAFE_NO_PAD.decode(key[name].as_str().unwrap()).unwrap())
-    };
-    let public = RsaPublicKey::new(number("n"), number("e")).unwrap();
-    let signature =
-        Signature::try_from(URL_SAFE_NO_PAD.decode(signature).unwrap().as_slice()).unwrap();
-    VerifyingKey::<Sha256>::new(public)
-        .verify(format!("{header}.{payload}").as_bytes(), &signature)
-        .expect("the broker's signature verifies");
-    (header_json, claims)
 }
 
 // ---------------------------------------------------------------------------

@@ -10,17 +10,14 @@ cd "$(dirname "$0")/.."
 STORE=00000000000000000000000000000000
 PERSIST=.wrangler/integration
 LOG=${CLOUDFLARE_STS_API_LOG:-$PWD/.wrangler/integration.log}
-KEYS=$(mktemp -d)
-trap 'rm -rf "$KEYS"; [ -n "${DEV:-}" ] && kill "$DEV" 2>/dev/null; wait 2>/dev/null || true' EXIT
+trap '[ -n "${DEV:-}" ] && kill "$DEV" 2>/dev/null; wait 2>/dev/null || true' EXIT
 
 rm -rf "$PERSIST" && mkdir -p "$PERSIST"
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$KEYS/signing.pem" 2>/dev/null
 secret() {
-  # --value= keeps a PEM's leading dashes from being read as a flag.
+  # --value= keeps a value's leading dashes from being read as a flag.
   wrangler secrets-store secret create "$STORE" --name "$1" --scopes workers --value="$2" --persist-to "$PERSIST" >/dev/null
 }
 secret cloudflare-token test-cloudflare-token
-secret signing-key "$(cat "$KEYS/signing.pem")"
 
 # The policy: two KV keys, as in a deployment. The Worker holds it for a minute.
 kv() {
