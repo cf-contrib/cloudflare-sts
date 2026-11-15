@@ -2,8 +2,8 @@
 //! the policy and secrets in the Worker's [`Config`]. [`TokenServiceHandler`]
 //! is `TokenServiceApi`: the token exchange and revocation, and the cron's
 //! cleanup of the tokens the broker minted. [`DiscoveryServiceHandler`] is
-//! `DiscoveryServiceApi`: the metadata and keys services verify the broker's
-//! own tokens with, which are public.
+//! `DiscoveryServiceApi`: the authorization server metadata (RFC 8414), which is
+//! public.
 //!
 //! # Send
 //!

@@ -132,8 +132,7 @@ hands out, as HCL, and who gets it, as Cedar.
 - `profiles`: what callers may get. Untyped, because a token policy's
   `resources` are flat in one profile and nested in another, as Cloudflare
   takes them; the plan checks each has a name, and the broker checks the rest.
-  `forward_claims` names the caller's claims to copy into a token for another
-  service.
+  `forward_claims` names the caller's claims the audit log shows.
 - `defaults`: the TTLs of profiles that don't set their own.
 - `cedar_policy`: who gets what, as Cedar text. It must permit
   `Admit::Action::"<provider>"` for every provider, pinning your organization,
@@ -323,6 +322,12 @@ curl -fsSL https://github.com/cf-contrib/cloudflare-sts/releases/download/v0.23.
 
 Set `release_tag = "latest"` to track the newest release instead.
 
+Upgrading from 0.22: the Worker no longer has a signing key, so delete any
+`signing_key_secret` you passed and the secret it named, and drop `audience`
+from profiles (use `access` to reach an application behind Access). A provider
+for people has no `client_id`: its `audience` is the client ID. See the
+[broker's README](../../crates/cloudflare-sts-api#migration-from-022).
+
 Upgrading from cf-sts (before v0.18.0): the Worker's bindings are now
 `CLOUDFLARE_STS_API_*` (were `CF_STS_API_*`), minted tokens are named
 `cloudflare-sts:…`, and the R2 token type is
@@ -352,7 +357,7 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
 | `zone_id` | for a custom domain | `null` | Zone ID of the zone holding a custom-domain `hostname`. |
 | `cloudflare_token_secret` | yes | | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the Cloudflare token. With a profile's `bucket`, the token also needs R2 permissions covering what it delegates. |
 | `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ? }` each. `audience` defaults to the broker's URL; for [people](../../crates/cloudflare-sts-api#people) it is the client they sign in as. See [Policy](#policy). |
-| `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `access`, `audience`. See [Policy](#policy). |
+| `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `access`, `ttl`, `max_ttl`, `enabled`. See [Policy](#policy). |
 | `cedar_policy` | yes | | Who gets what: Cedar text with a permit for `Admit::Action::"<provider>"` for every provider, pinning your org, and `Profile::Action::"<name>"` for every profile, each with an `@id`. See [Policy](#policy). |
 | `defaults` | no | `{}` | `{ ttl?, max_ttl? }`: the TTLs of profiles that don't set their own. |
 | `worker_dir` | no | `null` | A local build (`index.js`, `index_bg.wasm`) to deploy instead of a release. |

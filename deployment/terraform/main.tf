@@ -1,8 +1,8 @@
 locals {
   custom_domain = !endswith(var.hostname, ".workers.dev")
 
-  # The broker's URL: the issuer of its own tokens, and the audience of the
-  # tokens it takes, unless a provider names another.
+  # The broker's URL: the policy's issuer, and the audience of the tokens it
+  # takes, unless a provider names another.
   broker_url = "https://${var.hostname}"
 }
 

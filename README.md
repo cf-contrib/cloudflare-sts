@@ -24,7 +24,7 @@ steps:
   - uses: cf-contrib/cloudflare-sts@v0.23.0 # x-release-please-version
     with:
       url: https://cloudflare-sts-api.example.com
-      profile: example-org/app:ci.deploy
+      scopes: example-org/app:ci.deploy # one or more profiles, space-separated
   - run: npx wrangler deploy # CLOUDFLARE_API_TOKEN + CLOUDFLARE_ACCOUNT_ID are set
 ```
 
@@ -36,6 +36,8 @@ steps:
 | [`deployment/terraform`](deployment/terraform) | `//deployment/terraform?ref=<version>` | Deploys the released Worker with your policy, its bindings and its cron. |
 
 The action and the broker, with its Terraform module, are released together from one tag, so deploy the broker from the release whose action you use. The action talks only to the broker, never to the Cloudflare API.
+
+**Upgrading from 0.22:** the action's `profile` input is now `scopes`, and the broker no longer issues tokens of its own or lists sign-in providers. See the [migration table](crates/cloudflare-sts-api#migration-from-022).
 
 People on their own machines use [cf-vault](https://github.com/cf-contrib/cf-vault): it signs in through your identity provider, trades the ID token at this broker, runs a command with the credentials and revokes the token when it exits. This repository no longer ships a command-line client.
 
@@ -52,7 +54,7 @@ sequenceDiagram
 
     Job->>OIDC: 1. request an OIDC token (aud = the action's url)
     OIDC-->>Job: JWT
-    Job->>Broker: 2. POST /oauth/token (RFC 8693, the JWT as subject_token)
+    Job->>Broker: 2. POST /oauth/token (RFC 8693, the JWT as subject_token, the profiles as scope)
     Broker->>OIDC: metadata and keys (cached)
     Broker->>Broker: 3. verify the JWT, check the Cedar policy, pick the profile
     Broker->>CF: 4. look up permission groups, create the token (expires_on)

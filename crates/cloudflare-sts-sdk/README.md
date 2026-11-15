@@ -23,8 +23,8 @@ CI compiles it again and fails if the document differs from the one checked in.
 
 | Feature | |
 |---|---|
-| (always) | the types: requests, responses, the authorization server metadata (RFC 8414) and OpenID Provider metadata, the JWKS, OAuth errors, with `Error::new`. The health endpoints' paths, `HEALTH_LIVE_PATH` and `HEALTH_READY_PATH`. |
-| `server` | A trait per tag, `TokenServiceApi` (the exchange and revocation) and `DiscoveryServiceApi` (the metadata and keys), a response enum per operation, and an axum router per trait, `token_service_api_router` and `discovery_service_api_router`, that checks each request against the spec before it reaches a handler. `HealthHandler`, which answers the health endpoints beside it, `/health/live` and `/health/ready`: ready only while every `HealthCheck` given to `readiness` passes, `503` otherwise. |
+| (always) | the types: requests, responses, the authorization server metadata (RFC 8414), OAuth errors, with `Error::new`. The health endpoints' paths, `HEALTH_LIVE_PATH` and `HEALTH_READY_PATH`. |
+| `server` | A trait per tag, `TokenServiceApi` (the exchange and revocation) and `DiscoveryServiceApi` (the metadata), a response enum per operation, and an axum router per trait, `token_service_api_router` and `discovery_service_api_router`, that checks each request against the spec before it reaches a handler. `HealthHandler`, which answers the health endpoints beside it, `/health/live` and `/health/ready`: ready only while every `HealthCheck` given to `readiness` passes, `503` otherwise. |
 | `client` | `HttpClient`, a method per operation, and `HealthClient`, which asks the health endpoints. |
 
 Bodies are form-encoded (`application/x-www-form-urlencoded`), as RFC 8693 and
