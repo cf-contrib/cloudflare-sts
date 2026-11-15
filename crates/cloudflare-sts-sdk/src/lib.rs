@@ -10,7 +10,7 @@
 //! # What is in it
 //!
 //! - **Types**: [`v1::TokenExchangeRequest`] and [`v1::TokenExchangeResponse`],
-//!   [`v1::TokenRevocationRequest`], the authorization server metadata and JWKS, and
+//!   [`v1::TokenRevocationRequest`], the authorization server metadata, and
 //!   [`v1::Error`], the body of every error, with [`v1::Error::new`].
 //! - **Server** (`server` feature): a trait per tag, `TokenServiceApi` and
 //!   `DiscoveryServiceApi`, a response enum per operation, and a router per

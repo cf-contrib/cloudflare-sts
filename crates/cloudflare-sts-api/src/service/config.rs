@@ -2140,21 +2140,43 @@ pub(super) mod tests {
         );
     }
 
-    /// The first fenced block of `lang` in the README.
-    fn readme_block(lang: &str) -> &'static str {
+    /// The `n`th (from 0) fenced block of `lang` in the README.
+    fn readme_block(lang: &str, n: usize) -> &'static str {
         let readme = include_str!("../../README.md");
-        let start = readme
-            .find(&format!("```{lang}\n"))
-            .unwrap_or_else(|| panic!("a {lang} block in the README"))
-            + lang.len()
-            + 4;
+        let fence = format!("```{lang}\n");
+        let mut from = 0;
+        let mut start = 0;
+        for _ in 0..=n {
+            start = from
+                + readme[from..]
+                    .find(&fence)
+                    .unwrap_or_else(|| panic!("a {lang} block #{n} in the README"))
+                + fence.len();
+            from = start;
+        }
         &readme[start..start + readme[start..].find("```").unwrap()]
     }
 
     #[test]
+    fn loads_the_readmes_opening_example() {
+        let policy = PolicyConfig::parse(
+            readme_block("toml", 0),
+            readme_block("cedar", 0),
+            ACCOUNT_ID,
+        )
+        .expect("the README's opening example should load");
+        assert_eq!(policy.providers.len(), 1);
+        assert_eq!(policy.profiles.len(), 1);
+    }
+
+    #[test]
     fn loads_the_readmes_example() {
-        let policy = PolicyConfig::parse(readme_block("toml"), readme_block("cedar"), ACCOUNT_ID)
-            .expect("the README's example policy should load");
+        let policy = PolicyConfig::parse(
+            readme_block("toml", 1),
+            readme_block("cedar", 1),
+            ACCOUNT_ID,
+        )
+        .expect("the README's example policy should load");
         assert_eq!(policy.providers.len(), 3);
         assert_eq!(policy.profiles.len(), 5);
 

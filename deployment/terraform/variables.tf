@@ -57,7 +57,7 @@ variable "profiles" {
   # Untyped: a token policy's resources are flat or nested maps, as Cloudflare
   # takes them, and no one Terraform type holds both. The broker checks them.
   type        = any
-  description = "What callers may get: the policy's profiles. A list of objects, each with a name, optionally the forward_claims to copy into a token for a service, and a token, a bucket, an access (an Access service token), or a service's audience, as the broker's README describes. Who gets each is the `cedar_policy`'s."
+  description = "What callers may get: the policy's profiles. A list of objects, each with a name, optionally the forward_claims to show in the audit log, and a token, a bucket, an access (an Access service token), or a mix, as the broker's README describes. Who gets each is the `cedar_policy`'s."
 
   validation {
     condition     = try(length(var.profiles) > 0 && alltrue([for profile in var.profiles : length(profile.name) > 0]), false)
