@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.1](https://github.com/cf-contrib/cloudflare-sts/compare/v0.23.0...v0.23.1) (2026-11-16)
+
+
+### Bug Fixes
+
+* **nix:** worker-build builds its own zstd, as nixpkgs links the system one since its November release ([#135](https://github.com/cf-contrib/cloudflare-sts/issues/135)) ([3fcce73](https://github.com/cf-contrib/cloudflare-sts/commit/3fcce73660b6d3659e40d2192387f3b00ccd7b24))
+
 ## [0.23.0](https://github.com/cf-contrib/cloudflare-sts/compare/v0.22.0...v0.23.0) (2026-11-14)
 
 
