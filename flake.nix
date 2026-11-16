@@ -35,7 +35,8 @@
             pkgs.nodejs_24
             # The Rust Worker.
             pkgs.pkg-config
-            pkgs.worker-build
+            # nixpkgs builds the -sys crates against the libraries of the system, since its November release, and zstd-sys finds no libzstd: it builds its own
+            (pkgs.worker-build.overrideAttrs { dontCargoUseSystemLibs = true; })
             rust-toolchain
             # Both.
             pkgs.wrangler
