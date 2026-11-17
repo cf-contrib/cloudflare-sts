@@ -21,7 +21,7 @@ serde_json = { version = "1", optional = true }
 async-trait = { version = "0.1", optional = true }
 axum = { version = "0.8", default-features = false, features = ["json"], optional = true }
 http-body-util = { version = "0.1", optional = true }
-jsonschema = { version = "0.60", default-features = false, optional = true }
+jsonschema = { version = "0.61", default-features = false, optional = true }
 mime = { version = "0.3", optional = true }
 serde_urlencoded = { version = "0.7", optional = true }
 
@@ -61,4 +61,4 @@ client = [
 [build-dependencies]
 # Generates the API from the OpenAPI document, in build.rs. Without the `cli`
 # default it is only the library: no clap, no reqwest.
-openapi-to-rust = { version = "0.23", default-features = false }
+openapi-to-rust = { version = "0.24", default-features = false }
