@@ -9,9 +9,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 cedar-policy = { version = "4", default-features = false }
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+toml = { version = "1.2", default-features = false, features = ["parse", "serde"] }
 # `http` hands `fetch` an http::Request, which the SDK's axum router takes.
-worker = { version = "0.8", features = ["http", "axum"] }
+worker = { version = "0.9", features = ["http", "axum"] }
 
 # The API: its types, and the traits and router the Worker implements.
 cloudflare-sts-sdk = { path = "../cloudflare-sts-sdk", features = ["server"] }
