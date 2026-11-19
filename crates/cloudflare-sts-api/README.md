@@ -55,7 +55,7 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
 
 ## Deploy
 
-1. **Create the Cloudflare token.** In the Cloudflare dashboard, create an **account-owned** API token with **Account API Tokens Write**. If any profile has a [`bucket`](#buckets), also give it R2 permissions covering what the buckets delegate, and **Access: Service Tokens Write** if any has an [`access`](#access-service-tokens). It's the broker's only long-lived credential. This is the one manual step: automating it would need a token that can create tokens. Store it in [Secrets Store](https://developers.cloudflare.com/secrets-store/) so it never passes through your deploy tooling:
+1. **Create the Cloudflare token.** In the Cloudflare dashboard, create an **account-owned** API token with **Account API Tokens Write**. If any profile has a [`bucket`](#buckets), also give it R2 permissions covering what the buckets delegate, and **Access: Service Tokens Write** if any has an [`access`](#access-service-tokens). Add **Secrets Store Write** if you want the broker to [replace the token itself](#rotating-the-cloudflare-token). It's the broker's only long-lived credential. This is the one manual step: automating it would need a token that can create tokens. Store it in [Secrets Store](https://developers.cloudflare.com/secrets-store/) so it never passes through your deploy tooling:
    ```sh
    wrangler secrets-store secret create <store-id> --name cloudflare-sts-cloudflare-token --scopes workers --remote
    ```
@@ -75,10 +75,10 @@ A job in `example-org/app` (repo `200000003`), on `main`, in the `prod` environm
 | Binding | Type | Required | Description |
 |---|---|---|---|
 | `CLOUDFLARE_STS_API_ACCOUNT_ID` | plain text | yes | Account the Cloudflare token belongs to and tokens are minted in. |
-| `CLOUDFLARE_STS_API_POLICY_KV` | Workers KV namespace | yes | Holds the [policy](#policy) under two keys: `config`, the TOML (or JSON), and `policy`, the Cedar. No size limit to speak of (a Worker variable held 5 KB). Each isolate keeps the policy it read for a minute. |
-| `CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN` | Secrets Store secret | yes | Account-owned token with Account API Tokens Write, plus R2 permissions covering what profiles' buckets delegate, plus Access: Service Tokens Write for profiles with an `access`. Read on every request, so rotating the secret takes effect without a redeploy. Anything else, such as a plain `wrangler secret`, is refused with `500`. |
+| `CLOUDFLARE_STS_API_POLICY_KV` | Workers KV namespace | yes | Holds the [policy](#policy) under two keys: `config`, the TOML (or JSON), and `policy`, the Cedar. [Rotation](#rotating-the-cloudflare-token) keeps `rotation` and `rotation.creating` here too. No size limit to speak of (a Worker variable held 5 KB). Each isolate keeps the policy it read for a minute. |
+| `CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN` | Secrets Store secret | yes | Account-owned token with Account API Tokens Write, plus R2 permissions covering what profiles' buckets delegate, plus Access: Service Tokens Write for profiles with an `access`, plus Secrets Store Write if the policy has a [`rotation`](#rotating-the-cloudflare-token). Read on every request, so rotating the secret takes effect without a redeploy. Anything else, such as a plain `wrangler secret`, is refused with `500`. |
 
-The hourly cron (`17 * * * *` in the examples) deletes expired `cloudflare-sts:*` tokens.
+The hourly cron (`17 * * * *` in the examples) deletes expired `cloudflare-sts:*` tokens, and, where the policy asks for it, [replaces the broker's own Cloudflare token](#rotating-the-cloudflare-token).
 
 The Terraform module builds `config` from its `oidc_providers`, `profiles`
 and `defaults` variables, takes `policy` from its `cedar_policy`, and writes
@@ -438,6 +438,146 @@ These are enforced when the policy loads, so an unsafe policy never serves a req
 2. **Every policy is named and scoped.** Each has a unique `@id`, and a `permit` names its provider or profile, so none lets everything in. A policy naming a provider or profile that doesn't exist is refused, and so is an enabled profile that nothing permits.
 3. **No token-management permissions.** Granting (`effect: allow`) any permission group whose name contains `API Tokens`, in any case, is rejected, so a job can't turn its short-lived token into a long-lived one. A `deny` may name one.
 4. **TTLs are capped.** `max_ttl` is at most 24h, and `ttl` can't exceed it.
+5. **A rotation can't cut credentials short.** When there's a [`rotation`](#rotating-the-cloudflare-token), its `overlap` must be longer than the longest `max_ttl` any enabled profile hands out, and at most half its `every`. A `rotation` that isn't `enabled` is checked too, but a mistake in it is only a warning: an opt-in nobody opted into has no business refusing the policy.
+
+### Rotating the Cloudflare token
+
+Opt-in. Without a `rotation` table the broker never touches its own token, and
+rotating it stays a thing you do by hand.
+
+```toml
+[rotation]
+enabled = true
+every   = "30d"   # how old the Cloudflare token may get
+overlap = "25h"   # how long the one it replaces stays alive
+
+[rotation.secret]
+store_id = "<secrets-store-id>"   # the secret the Worker's binding reads
+name     = "cloudflare-sts-cloudflare-token"
+```
+
+With it on, the broker's token additionally needs **Secrets Store Write**
+(listing the store to find the secret, and patching it). The Terraform module
+fills `rotation.secret` in from its `cloudflare_token_secret` variable, the same
+one the binding comes from, so the two can't name different secrets.
+
+The rotation runs before the hourly cleanup. The cleanup lists every token in
+the account and deletes each expired one, so a large backlog can spend the
+invocation's subrequest budget; an hour of expired tokens lying about costs
+much less than a provisioning token left to expire with nothing able to replace
+it.
+
+On the hourly cron, when the token is older than `every` — or is close enough
+to its own `expires_on` that another turn of the cron wouldn't fit before it
+lapsed, so a token given a shorter life than the period is replaced in good
+time rather than after it has stopped working — the broker:
+
+1. finds the secret in the store, before it creates anything;
+2. writes down the name it is about to use, so a create whose answer never comes back still leaves something to find the copy by;
+3. creates a **copy** of its own token — the same policies and `condition`, named `cloudflare-sts-broker:<its own host>.<digest>:<unix-time>` — and checks the copy works;
+4. writes the copy into the secret, naming back its scopes and comment so a patch can't drop them;
+5. waits until Cloudflare says the binding hands the copy over, and deletes the token it replaced an `overlap` after that.
+
+The name carries the broker's own host, and a digest of its whole URL, because
+tokens are listed account-wide: without that, two brokers in one account would
+each take the other's live token for an orphan, and two whose hostnames differ
+only past the part that fits would do the same.
+
+The sweep that collects what a swap left behind runs only on the turns where
+something is outstanding — every way the broker can leave a copy unaccounted
+for writes its name down first — so an ordinary turn doesn't list the account's
+tokens at all, and the turns that do aren't also trying to swap. It deletes the
+copy its own record names, which was never written to the secret and so never
+fathered anything. Anything else of the broker's that no record accounts for is
+given a drain window first and deleted after: its age says when it was made,
+not when it stopped being read, and an operator may have changed the secret by
+hand a moment ago.
+
+The record of a copy outlives any attempt to throw it away. A write Cloudflare
+refuses has the copy deleted, but the record stays until Cloudflare says the
+copy is gone: a deletion that fails, or a turn that stops between the two,
+would otherwise leave a token with the broker's own permissions and nothing
+anywhere that knew of it. A later turn finds the copy still there and tries
+again.
+
+It replaces rather than rolls in place. `PUT /accounts/{id}/tokens/{id}/value`
+invalidates the old value the moment it answers, so a Secrets Store write that
+then failed would leave the Worker holding a dead credential it can't
+authenticate with to fix. Copying means every failure leaves the old token live
+and the broker serving: a secret that isn't there costs nothing, because it's
+looked up first, and a write Cloudflare **refuses** has the copy deleted again.
+
+A write that fails in a way that can't say whether it applied is not a refusal.
+A refusal is a `4xx`, or a `2xx` that says `success: false`; a request that
+never came back, a `5xx`, and a `2xx` whose body can't be read are all silence.
+On silence the copy and the token it replaces both stay, and so does the record
+of the swap: if the write had in fact taken, discarding the copy would leave the
+secret holding a token that no longer exists. The next turn sees which token the
+binding hands over and finishes or voids the swap on that.
+
+The record is kept until the binding is seen to hand the copy over, even once
+the write has been accepted. It is the only thing that tells the sweep the copy
+isn't an orphan, and a handover slower than an overlap would otherwise have the
+copy deleted out of the secret that holds it.
+
+The overlap exists because R2 credentials name the Cloudflare token as their
+`parent_access_key_id`: deleting it takes them with it. Its clock starts when
+the binding is **seen** to hand over the copy, not when the write happened,
+because until the Worker stops reading the old token it goes on fathering
+credentials that have to outlive it, and the window carries a few minutes on
+top for a request that was already holding the replaced token when the handover
+was seen. `overlap` must be longer than the longest `max_ttl` a profile hands
+out, which the guardrails check. The token the binding
+still hands over is never deleted, however overdue — so a `rotation.secret` that
+names the wrong secret jams, visibly, rather than taking the broker down.
+
+> [!WARNING]
+> Shortening a profile's `max_ttl`, or switching it off, doesn't shorten the
+> credentials already issued under it. The guardrail only knows the policy it's
+> reading, so lower an `overlap` only once the longer-lived credentials that
+> were issued before have expired.
+
+A `rotation` with `enabled = false` is still read and checked, so a deployment
+can carry its settings before it switches them on. A `rotation` that isn't
+`enabled` and holds a value the broker would refuse — a period too short, a
+duration or a secret field of the wrong shape, a `secret` left out or half
+given — is a `rotation.unusable` warning
+rather than a refused policy. A field the broker doesn't know is still refused,
+switched on or not, as it is anywhere else in the policy: a misspelling can't be
+told from a setting it ought to be honouring. Switching
+it off doesn't abandon a swap already made: a replaced token still waiting is
+still retired, and a copy still unaccounted for is still swept, because copies
+have no expiry and the cleanup is deliberately blind to their name, so nothing
+else would ever collect them.
+
+| Log line | What happened |
+|---|---|
+| `rotation.swapped` | Secrets Store took the copy. The token it replaced starts draining once the binding hands the copy over |
+| `rotation.handover` | The binding hands over the copy; the token it replaced starts draining |
+| `rotation.retired` | A replaced token drained, and it's deleted |
+| `rotation.voided` | A swap's copy is gone, or was never in anyone's hands and has been deleted; the record is cleared |
+| `rotation.discarded` | A copy the broker gave up on was deleted, or couldn't be and will be tried again |
+| `rotation.waiting` | The handover is overdue, or a replaced token is: check `rotation.secret` names the secret the Worker is bound to |
+| `rotation.unsettled` | A turn died mid-swap and the binding **still hands over the token being replaced**. Nothing is deleted. If the secret holds the copy, wait for it to propagate; if it still holds the replaced token, delete the copy and clear the `rotation` key. Never delete the replaced token: it's the one in use |
+| `rotation.stuck` | A turn died mid-swap and the binding hands over neither token. Nothing is deleted: see which of the two the secret holds, delete the other once the R2 credentials it fathered have expired, and clear the `rotation` key |
+| `rotation.swept` | The copy an unanswered create left behind, deleted — or reported as still there, to be tried again |
+| `rotation.adopted` | A token of the broker's that no record accounted for, given a drain window rather than deleted on the spot |
+| `rotation.unusable` | A `rotation` that isn't `enabled` has settings the broker would refuse if it were |
+| `rotation.failed` | The turn gave up; the token the binding hands over is untouched |
+
+The broker keeps two keys of its own in the [KV namespace](#bindings) beside
+`config` and `policy`, neither of them Terraform's: `rotation`, holding the swap
+in flight and the tokens waiting out their overlap, and `rotation.creating`,
+holding the name of a copy it is about to make. They're apart because a swap
+writes one of each in the space of two API calls, and Workers KV takes one write
+per key per second — sharing a key would have the second refused whenever those
+calls came back quickly, and a swap that can't record itself undoes itself.
+
+A record only ever goes once Cloudflare says the thing it names is gone. A copy
+the broker gives up on is deleted, but its record stays until the deletion is
+confirmed, and a later turn tries again; the name in `rotation.creating` is the
+broker's own, so it's proof enough of ownership even after the host the prefix
+is derived from has changed.
 
 ## HTTP API
 
@@ -552,7 +692,7 @@ For the caller's own mistakes (400) the description says what was wrong, for exa
 | One repo reaches another's R2 keys | Prefixes must end in `/`, placeholders fill whole segments from verified claims with a fixed character set, and both the template and the result are checked. Prefer ID-based prefixes |
 | Stolen JWT replayed | Short JWT lifetime and a custom audience |
 | One caller reaches another's R2 keys through a prefix claim | A value spans path segments only as a template's one placeholder, and every filled-in prefix is checked again |
-| Cloudflare token exfiltrated | Kept in Secrets Store, so it isn't in Terraform state or CI. Only code running in the Worker can read it. Restrict who can deploy Workers in the broker's account, rotate the Cloudflare token, and consider a dedicated account per trust domain. |
+| Cloudflare token exfiltrated | Kept in Secrets Store, so it isn't in Terraform state or CI. Only code running in the Worker can read it. Restrict who can deploy Workers in the broker's account, turn on [`rotation`](#rotating-the-cloudflare-token) so it's replaced on a period rather than living forever, and consider a dedicated account per trust domain. |
 | Token flooding | Only callers the policy allows can mint. Tokens are short-lived, revoked at job end, and cleaned up hourly. There's no rate limit yet (see [Limitations](#limitations)). |
 
 ### Audit log
@@ -594,7 +734,9 @@ The other events:
 | `token.revoke` | `token_id`, or `reason` | A revocation: the token deleted, or `already_gone`, `not_minted` (the token isn't the broker's), `discarded` (deleted because the profile's R2 credentials failed) or `discard_failed` |
 | `token.cleanup` | `token_id`, `name`, `expires_at` | The cron deleted an expired token |
 | `cleanup.done` | `deleted` | The cron's run, and how many it deleted |
-| `cleanup.failed` | `error`, `message` | The cron's run failed |
+| `cleanup.failed` | `error`, `message` | The cron's cleanup failed. The rotation still gets its turn |
+| `cron.failed` | `message` | The cron couldn't read the bindings or the policy, so it did neither half |
+| `rotation.*` | | [Replacing the Cloudflare token](#rotating-the-cloudflare-token): `swapped`, `retired`, `reconciled`, `waiting`, `stuck`, `failed`, and `started`, `discarded`, `skipped`, `expiry_dropped` |
 | `misconfigured` | `message` | The bindings or the policy are invalid: the first problem |
 | `unready` | `message` | `/health/ready` answered `503`: a secret can't be read, and why |
 
@@ -610,6 +752,9 @@ The other events:
 - **Secrets Store is required, and in open beta.** The Cloudflare token is only accepted from Secrets Store, so a plain Worker secret can't end up in Terraform state or deploy tooling. Accounts without Secrets Store can't run the broker yet.
 - **Access service tokens last at least 10 minutes,** and a job that dies before its last step leaves its token valid until then. One application per grant, and Access can't scope a token to reads.
 - **R2 credentials can't be revoked early.** They last their TTL; only rolling the Cloudflare token cuts them all off. One bucket per grant, and only buckets outside a jurisdiction.
+- **A rotation replaces the token, it doesn't roll it.** The replacement has a new ID, and no expiry: a Cloudflare token you gave an `expires_on` is replaced by one that doesn't expire, because `every` is its lifetime now. Anything of yours that names the token by ID has to be updated, and the hand-made token the first rotation replaces is deleted an `overlap` after the handover, not at once.
+- **A rotation's overlap is only as good as the policy it was checked against.** The guardrail compares it with the `max_ttl`s in force when the policy loads; credentials issued under a longer `max_ttl` that has since been shortened can outlive it.
+- **A rotation sweeps by name, so don't name your own tokens like its copies.** It only ever deletes tokens called `cloudflare-sts-broker:<its own host>:…` that no record accounts for, which keeps two brokers in one account off each other's. A token you create yourself under that exact prefix is fair game.
 - **No rate limit.** A workflow the policy allows can mint as often as it runs. Each token expires within minutes, is revoked at job end and cleaned up hourly, but a compromised workflow could still create many tokens at once. Cloudflare's rate-limit binding was tried and didn't enforce a 30-per-minute limit against ~85 requests a minute, so it was left out. An exact per-repository limit (e.g. a Durable Object) may come later.
 
 ## Code
@@ -624,6 +769,7 @@ The crate is laid out as cloudflare-nix's Worker is:
 | `src/oidc/` | OIDC tokens in the Worker, verified: the JWT format (RFC 7515, 7519), providers found by `iss` with their keys from the issuer's metadata (RFC 7517, 8414, OpenID Connect Discovery), and RS256 through the runtime's WebCrypto. |
 | `src/service/layer.rs` | Exchange auth, as a tower layer over `oidc`: the subject token's provider by `iss`, RS256 against the issuer's keys with WebCrypto, the standard claims, and whether the policy admits it. And `OAuthResponseLayer`, OAuth's rules for every response: the generated validation's refusals as `invalid_request`, and `Cache-Control: no-store`; `cache_publicly`, the discovery endpoints' `public, max-age=300`. |
 | `src/service/handler.rs` | The generated API's implementation, a handler per trait. `TokenServiceHandler`: the exchange (profiles, and Cloudflare tokens, R2 credentials and Access service tokens through [cloudflare-rs](https://github.com/cf-contrib/cloudflare-rs)), revocation, and the cleanup the cron runs. `DiscoveryServiceHandler`: the RFC 8414 metadata. |
+| `src/service/rotate.rs` | The cron's other half, and opt-in: [replacing the broker's own Cloudflare token](#rotating-the-cloudflare-token), and the one KV key it keeps to know what it's in the middle of. `src/service/secrets.rs` is the three Secrets Store calls that needs, written by hand over `fetch` as `src/service/access.rs` is. |
 
 ## Development
 

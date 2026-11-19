@@ -53,8 +53,9 @@ use crate::oidc::{self, Jwt};
 pub(super) const TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 /// Every minted token's name starts with this. Revocation and the cleanup
-/// never touch anything else.
-const TOKEN_PREFIX: &str = "cloudflare-sts:";
+/// never touch anything else, which is why the tokens the broker makes for
+/// [itself](super::rotate) are named outside it.
+pub(super) const TOKEN_PREFIX: &str = "cloudflare-sts:";
 
 /// The longest token name Cloudflare takes.
 const NAME_MAX: usize = 120;

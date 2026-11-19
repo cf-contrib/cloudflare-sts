@@ -63,10 +63,10 @@ sequenceDiagram
     Note over Job: 5. mask and export CLOUDFLARE_API_TOKEN<br/>and CLOUDFLARE_ACCOUNT_ID for later steps
     Job->>Broker: 6. POST /oauth/revoke (RFC 7009, the post step)
     Broker->>CF: verify it, check it's a cloudflare-sts token, delete it
-    Note over Broker,CF: an hourly cron deletes expired cloudflare-sts:* tokens
+    Note over Broker,CF: an hourly cron deletes expired cloudflare-sts:* tokens,<br/>and can replace the broker's own token on a period
 ```
 
-The only long-lived credential is the broker's **Cloudflare token**: an account-owned token with **Account API Tokens Write**, plus R2 permissions if profiles hand out [prefix-limited R2 credentials](crates/cloudflare-sts-api#buckets), and **Access: Service Tokens Write** if they hand out [Access service tokens](crates/cloudflare-sts-api#access-service-tokens) (e.g. one shared Terraform-state bucket, each repo limited to its own prefix). It lives in Cloudflare Secrets Store, bound to the Worker, so it never passes through Terraform or CI and never leaves the Worker.
+The only long-lived credential is the broker's **Cloudflare token**: an account-owned token with **Account API Tokens Write**, plus R2 permissions if profiles hand out [prefix-limited R2 credentials](crates/cloudflare-sts-api#buckets), and **Access: Service Tokens Write** if they hand out [Access service tokens](crates/cloudflare-sts-api#access-service-tokens) (e.g. one shared Terraform-state bucket, each repo limited to its own prefix). It lives in Cloudflare Secrets Store, bound to the Worker, so it never passes through Terraform or CI and never leaves the Worker. Opt in to [`rotation`](crates/cloudflare-sts-api#rotating-the-cloudflare-token) and the broker replaces it on a period, so it isn't long-lived either.
 
 ## Do you need it?
 

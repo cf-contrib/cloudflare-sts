@@ -11,6 +11,9 @@
 //! the crate root: they're a deployment check, not part of the API, so the
 //! spec doesn't declare them. Readiness asks [`health`]'s check of the
 //! config, which reads the secrets.
+//!
+//! [`rotate`] is the cron's other half, and opt-in: rolling the broker's own
+//! Cloudflare token, over the Secrets Store calls in [`secrets`].
 
 pub mod access;
 pub mod authz;
@@ -18,3 +21,5 @@ pub mod config;
 pub mod handler;
 pub mod health;
 pub mod layer;
+pub mod rotate;
+pub mod secrets;

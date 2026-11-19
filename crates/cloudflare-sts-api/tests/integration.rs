@@ -1256,3 +1256,1123 @@ mod access_service_tokens {
         assert!(world.cloudflare.service_tokens.contains_key(&foreign.id));
     }
 }
+
+/// Replacing the broker's own Cloudflare token, which `tests/config.toml`
+/// switches on.
+///
+/// The rotation keeps its state in Workers KV, and reaches most of that state
+/// only across turns of the cron, or hours later when an overlap runs out. Each
+/// test sets it with `set_rotation_state` before it fires the cron, so it
+/// starts the broker where it means to and inherits nothing from the last one.
+mod rotation {
+    use super::*;
+
+    const MONTH: i64 = 31 * 24 * 3600;
+    const HOUR: i64 = 3600;
+
+    /// What this broker names its own tokens by: its host, then a digest of
+    /// its whole issuer, so two brokers in one account never collect each
+    /// other's. The digest is `broker_prefix`'s, over `tests/config.toml`'s
+    /// issuer — spelled out here because the test binary can't call into the
+    /// Worker to derive it, and pinned by a unit test in `service::rotate` so
+    /// the two can't drift apart in silence.
+    const BROKER_PREFIX: &str = "cloudflare-sts-broker:127.0.0.1.ec92f4d1:";
+    const BROKER_TOKEN_NAME: &str = "cloudflare-sts-broker:127.0.0.1.ec92f4d1:1700000000";
+
+    /// Clears everything the broker remembers between turns.
+    fn clear_rotation_state() {
+        set_rotation_state(&json!({}));
+        set_creating(&json!(null));
+    }
+
+    /// Fires the cron, as Cloudflare would.
+    async fn cron() {
+        let res = call(Method::GET, "/__scheduled?cron=17+*+*+*+*").await;
+        assert_eq!(res.status, 200, "{}", res.text);
+    }
+
+    /// Makes the broker's Cloudflare token `seconds` old.
+    fn age_the_token(seconds: i64) {
+        let mut world = world();
+        let token = world
+            .cloudflare
+            .tokens
+            .get_mut(CLOUDFLARE_TOKEN_ID)
+            .expect("the broker's token");
+        token.issued_on = Some(at(-seconds));
+    }
+
+    /// A token an earlier turn of the cron could have left behind.
+    fn earlier_token(name: &str) -> String {
+        world().cloudflare.add(None, name, None, None, "active").id
+    }
+
+    /// The tokens the broker has made for itself.
+    fn broker_tokens() -> Vec<StoredToken> {
+        world()
+            .cloudflare
+            .tokens
+            .values()
+            .filter(|t| t.name.starts_with(BROKER_PREFIX))
+            .cloned()
+            .collect()
+    }
+
+    /// The one token the broker has made for itself.
+    #[track_caller]
+    fn the_copy() -> StoredToken {
+        match broker_tokens().as_slice() {
+            [copy] => copy.clone(),
+            made => panic!("exactly one copy should have been made: {made:?}"),
+        }
+    }
+
+    fn has(token_id: &str) -> bool {
+        world().cloudflare.tokens.contains_key(token_id)
+    }
+
+    #[tokio::test]
+    async fn replaces_its_own_cloudflare_token_when_it_falls_due() {
+        let t = start().await;
+        clear_rotation_state();
+        // The write doesn't reach the Worker until the test says so, which is
+        // what it's like while Secrets Store propagates.
+        world().cloudflare.propagate_secret = false;
+
+        // Young enough: the cron leaves it alone, and makes no copy.
+        cron().await;
+        assert!(broker_tokens().is_empty());
+        assert_eq!(
+            world().cloudflare.secrets[SECRET_ID].value,
+            CLOUDFLARE_TOKEN
+        );
+
+        // Due, but the policy's secret isn't in the store: it gives up before
+        // it creates anything, so there's nothing left over.
+        age_the_token(MONTH);
+        world().cloudflare.secrets.clear();
+        cron().await;
+        let failed = t.audit("rotation.failed").await.expect("a rotation.failed");
+        assert!(
+            failed["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("no secret called cloudflare-token")),
+            "{failed}"
+        );
+        assert!(
+            broker_tokens().is_empty(),
+            "nothing should be created before the secret is found"
+        );
+
+        // Due, the secret is there, but Secrets Store refuses the write and
+        // says so: the secret holds what it held, so the copy is deleted again
+        // and the broker is left as it was. This is the path an in-place roll
+        // couldn't come back from.
+        {
+            let mut world = world();
+            *world = World::new();
+            world.cloudflare.propagate_secret = false;
+            world.cloudflare.secret_patch = SecretPatch::Refused;
+        }
+        age_the_token(MONTH);
+        cron().await;
+        assert!(
+            t.audits("rotation.failed")
+                .await
+                .iter()
+                .any(|line| line["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("secrets.patch"))),
+            "{}",
+            t.log()
+        );
+        assert!(
+            broker_tokens().is_empty(),
+            "a copy that couldn't be written should be deleted again: {:?}",
+            broker_tokens()
+        );
+        assert!(
+            has(CLOUDFLARE_TOKEN_ID),
+            "the token it was replacing should be untouched"
+        );
+
+        // Due, and everything works: a copy of the token, with its policies,
+        // goes into the secret the binding reads.
+        {
+            let mut world = world();
+            *world = World::new();
+            world.cloudflare.propagate_secret = false;
+            world
+                .cloudflare
+                .tokens
+                .get_mut(CLOUDFLARE_TOKEN_ID)
+                .expect("the broker's token")
+                .policies = json!([{
+                "effect": "allow",
+                "permission_groups": [{ "id": "pg-workers-scripts-write" }],
+                "resources": { "com.cloudflare.api.account.0123456789abcdef0123456789abcdef": "*" },
+            }]);
+        }
+        age_the_token(MONTH);
+        cron().await;
+
+        let swapped = t
+            .audit("rotation.swapped")
+            .await
+            .expect("a rotation.swapped");
+        assert_eq!(swapped["old_token_id"], CLOUDFLARE_TOKEN_ID);
+        let copy = the_copy();
+        assert_eq!(swapped["new_token_id"], copy.id);
+        {
+            let world = world();
+            assert_eq!(
+                copy.policies, world.cloudflare.tokens[CLOUDFLARE_TOKEN_ID].policies,
+                "the copy should carry the same policies"
+            );
+            let secret = &world.cloudflare.secrets[SECRET_ID];
+            assert_eq!(secret.value, copy.value, "the copy should be in the secret");
+            assert_eq!(
+                secret.scopes,
+                json!(["workers"]),
+                "the scopes should survive the write, or the binding would stop reading it"
+            );
+            assert_eq!(
+                secret.comment.as_deref(),
+                Some("the broker's Cloudflare token"),
+                "the comment should survive the write"
+            );
+        }
+        assert!(
+            has(CLOUDFLARE_TOKEN_ID),
+            "the replaced token should outlive the swap by its overlap"
+        );
+
+        // Nothing is retiring yet, and the record still names the copy. Both
+        // matter: the window can't start until the Worker stops reading the
+        // replaced token, and a record that forgot the copy would let the
+        // sweep delete the very token Secrets Store now holds.
+        let state = rotation_state();
+        assert!(
+            state["retiring"].is_null(),
+            "nothing drains until the handover: {state}"
+        );
+        assert_eq!(state["pending"]["new_token_id"], copy.id, "{state}");
+        assert_eq!(
+            state["pending"]["old_token_id"], CLOUDFLARE_TOKEN_ID,
+            "{state}"
+        );
+        assert_eq!(
+            state["pending"]["attempt"], "taken",
+            "a write that was taken is what tells a slow handover from a lost one: {state}"
+        );
+
+        // The write hasn't reached the Worker yet, so the next turn finds the
+        // token it replaced is still the one in use. It deletes nothing, and
+        // doesn't start another swap.
+        cron().await;
+        assert_eq!(the_copy().id, copy.id, "no second copy");
+        assert!(
+            has(CLOUDFLARE_TOKEN_ID),
+            "the token the binding still hands over must never be deleted"
+        );
+
+        // Now it has. The copy is what the broker authenticates as, and the one
+        // it replaced waits out the rest of its overlap.
+        world().cloudflare.bound_value = copy.value.clone();
+        cron().await;
+        assert_eq!(the_copy().id, copy.id, "still no second copy");
+        assert!(
+            has(CLOUDFLARE_TOKEN_ID),
+            "the replaced token should wait out its whole overlap"
+        );
+        // Now that the handover has been seen, the record moves on and the
+        // window runs — for longer than the overlap, because a request that
+        // was already holding the replaced token can still mint with it just
+        // after the handover is seen.
+        let state = rotation_state();
+        assert!(
+            state["retiring"][0]["delete_after"]
+                .as_i64()
+                .is_some_and(|at| at - now() as i64 > 2 * HOUR),
+            "the drain should outlast the 2h overlap this policy sets: {state}"
+        );
+        assert!(state["pending"].is_null(), "the swap is done: {state}");
+        assert_eq!(
+            state["retiring"][0]["token_id"], CLOUDFLARE_TOKEN_ID,
+            "{state}"
+        );
+        assert!(
+            state["retiring"][0]["delete_after"]
+                .as_i64()
+                .is_some_and(|at| at > now() as i64),
+            "the drain window should start at the handover: {state}"
+        );
+        assert!(
+            t.audits("rotation.retired").await.is_empty(),
+            "nothing is retired before its overlap runs out"
+        );
+
+        // Its overlap is two hours out. Bring it forward rather than wait, and
+        // the next turn deletes it: the swap is finished, on the state the
+        // broker wrote for itself.
+        set_rotation_state(&json!({
+            "retiring": [{ "token_id": CLOUDFLARE_TOKEN_ID, "delete_after": now() as i64 - 1 }],
+        }));
+        cron().await;
+        let retired = t
+            .audit("rotation.retired")
+            .await
+            .expect("a rotation.retired");
+        assert_eq!(retired["token_id"], CLOUDFLARE_TOKEN_ID);
+        assert!(
+            !has(CLOUDFLARE_TOKEN_ID),
+            "the replaced token should be deleted once its overlap has run out"
+        );
+        assert!(has(&copy.id), "the copy that replaced it stays");
+    }
+
+    /// The one deletion that would take the broker down with it: the token the
+    /// binding still hands over. However overdue, it stays.
+    #[tokio::test]
+    async fn never_deletes_the_token_the_binding_still_hands_over() {
+        let t = start().await;
+        // Overdue by an overlap and more, and still what the Worker reads,
+        // which is what a `rotation.secret` naming the wrong secret looks like.
+        set_rotation_state(&json!({
+            "retiring": [{
+                "token_id": CLOUDFLARE_TOKEN_ID,
+                "delete_after": now() as i64 - 3 * HOUR,
+            }],
+        }));
+
+        cron().await;
+
+        assert!(
+            has(CLOUDFLARE_TOKEN_ID),
+            "the bound token must never be deleted, however overdue"
+        );
+        assert!(
+            t.audits("rotation.retired").await.is_empty(),
+            "nothing should have been retired"
+        );
+
+        // And it says which secret to go and look at.
+        let waiting = t
+            .audit("rotation.waiting")
+            .await
+            .expect("a rotation.waiting");
+        assert_eq!(waiting["token_id"], CLOUDFLARE_TOKEN_ID);
+        assert!(
+            waiting["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("rotation.secret")),
+            "it should say where to look: {waiting}"
+        );
+        // Jammed, not rolling on: a swap that hasn't settled starts no other.
+        assert!(broker_tokens().is_empty(), "{:?}", broker_tokens());
+    }
+
+    /// A turn that died between writing the secret and recording that it had.
+    /// The next turn sees the binding hands over the copy, and finishes the job.
+    #[tokio::test]
+    async fn finishes_a_swap_a_previous_turn_left_in_the_middle() {
+        let t = start().await;
+        let previous = earlier_token("the hand-made token");
+        set_rotation_state(&json!({
+            "pending": {
+                "new_token_id": CLOUDFLARE_TOKEN_ID,
+                "old_token_id": previous,
+                "at": now() as i64 - 600,
+            },
+        }));
+
+        cron().await;
+
+        let line = t
+            .audit("rotation.handover")
+            .await
+            .expect("a rotation.handover");
+        assert_eq!(line["new_token_id"], CLOUDFLARE_TOKEN_ID);
+        assert_eq!(line["old_token_id"], previous);
+        assert!(
+            has(&previous),
+            "the token it replaced starts its overlap now, it isn't deleted on the spot"
+        );
+
+        // Settled into a retirement, so the turn stops there rather than
+        // stacking another swap on top of it.
+        age_the_token(MONTH);
+        cron().await;
+        assert!(
+            t.audits("rotation.swapped").await.is_empty(),
+            "a token still retiring should hold off the next swap"
+        );
+    }
+
+    /// A write whose answer is lost may still have applied. Discarding the
+    /// copy on the strength of a failure would then leave the secret holding a
+    /// token that no longer exists, and take the broker down as it propagated.
+    #[tokio::test]
+    async fn keeps_both_tokens_when_it_cant_tell_whether_the_write_applied() {
+        let t = start().await;
+        clear_rotation_state();
+        {
+            let mut world = world();
+            // It applies, and then the answer goes missing: the worst case,
+            // and the one a caller that treats every failure as a refusal
+            // gets wrong.
+            world.cloudflare.secret_patch = SecretPatch::AppliedThenLost;
+            world.cloudflare.propagate_secret = false;
+        }
+        age_the_token(MONTH);
+
+        cron().await;
+
+        let failed = t.audit("rotation.failed").await.expect("a rotation.failed");
+        assert!(
+            failed["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("whether it applied isn't known")),
+            "it should say the outcome is unknown: {failed}"
+        );
+        let copy = the_copy();
+        assert!(
+            has(&copy.id),
+            "the copy must survive a write that may have applied"
+        );
+        assert!(
+            has(CLOUDFLARE_TOKEN_ID),
+            "and so must the token it replaces"
+        );
+        assert_eq!(
+            world().cloudflare.secrets[SECRET_ID].value,
+            copy.value,
+            "the write had in fact applied"
+        );
+
+        // Once the Worker picks the copy up, the next turn sees the swap did
+        // land after all and finishes it, with no one having had to intervene.
+        world().cloudflare.bound_value = copy.value.clone();
+        cron().await;
+        let line = t
+            .audit("rotation.handover")
+            .await
+            .expect("a rotation.handover");
+        assert_eq!(line["old_token_id"], CLOUDFLARE_TOKEN_ID);
+        assert!(has(&copy.id) && has(CLOUDFLARE_TOKEN_ID));
+    }
+
+    /// A swap whose write didn't take leaves the old token bound. Saying
+    /// "delete the other" there would be advice to delete the token in use.
+    #[tokio::test]
+    async fn says_the_write_hasnt_taken_while_the_replaced_token_is_still_bound() {
+        let t = start().await;
+        let copy = earlier_token(BROKER_TOKEN_NAME);
+        set_rotation_state(&json!({
+            "pending": {
+                "new_token_id": copy,
+                "old_token_id": CLOUDFLARE_TOKEN_ID,
+                "at": now() as i64 - 600,
+            },
+        }));
+
+        cron().await;
+
+        let line = t
+            .audit("rotation.unsettled")
+            .await
+            .expect("a rotation.unsettled");
+        assert_eq!(line["bound_token_id"], CLOUDFLARE_TOKEN_ID);
+        let said = line["message"].as_str().unwrap_or_default();
+        assert!(
+            said.contains("Don't delete the replaced token"),
+            "it must not advise deleting the token in use: {said}"
+        );
+        assert!(
+            t.audits("rotation.stuck").await.is_empty(),
+            "the two cases are told apart: this one knows which token is bound"
+        );
+        assert!(has(&copy) && has(CLOUDFLARE_TOKEN_ID), "nothing is deleted");
+    }
+
+    /// A copy whose record didn't survive is still findable: the broker names
+    /// its own tokens, so it can recognise one nothing accounts for.
+    #[tokio::test]
+    async fn gives_an_unaccounted_copy_a_window_before_deleting_it() {
+        let t = start().await;
+        // Not `clear_rotation_state`: this sets the intent below, and clearing
+        // it first would be two writes to that key in a breath, which Workers
+        // KV is entitled to refuse — the same limit the broker works around.
+        set_rotation_state(&json!({}));
+        let orphan = earlier_token(BROKER_TOKEN_NAME);
+        let foreign = earlier_token("someone else's token");
+        // Older than an overlap, so its age alone says nothing about when it
+        // stopped being used.
+        for id in [&orphan, &foreign] {
+            world().cloudflare.tokens.get_mut(id).unwrap().issued_on = Some(at(-3 * HOUR));
+        }
+        // Something for the sweep to answer, so it looks at all.
+        set_creating(&json!({
+            "name": "cloudflare-sts-broker:127.0.0.1.ec92f4d1:1600000000",
+            "at": now() as i64 - 3 * HOUR,
+        }));
+
+        cron().await;
+
+        // Not deleted: an operator may have put another token in the secret by
+        // hand a moment ago, and its age says when it was made, not when it
+        // stopped being read.
+        let adopted = t
+            .audit("rotation.adopted")
+            .await
+            .expect("a rotation.adopted");
+        assert_eq!(adopted["token_id"], orphan);
+        assert!(has(&orphan), "it drains before it goes");
+        let state = rotation_state();
+        assert_eq!(state["retiring"][0]["token_id"], orphan, "{state}");
+        assert!(
+            state["retiring"][0]["delete_after"]
+                .as_i64()
+                .is_some_and(|at| at - now() as i64 > 2 * HOUR),
+            "on a fresh window, not its age: {state}"
+        );
+        assert!(
+            has(&foreign),
+            "a token the broker didn't name for itself is never touched"
+        );
+        assert!(
+            has(CLOUDFLARE_TOKEN_ID),
+            "nor is the one the binding hands over"
+        );
+    }
+
+    /// A `2xx` whose body can't be read is not Cloudflare saying no. Treating
+    /// it as a refusal would discard the copy the secret may already hold.
+    #[tokio::test]
+    async fn keeps_the_copy_when_a_write_answers_with_something_unreadable() {
+        let t = start().await;
+        clear_rotation_state();
+        {
+            let mut world = world();
+            world.cloudflare.secret_patch = SecretPatch::AppliedThenUnreadable;
+            world.cloudflare.propagate_secret = false;
+        }
+        age_the_token(MONTH);
+
+        cron().await;
+
+        let copy = the_copy();
+        assert!(
+            has(&copy.id),
+            "an unreadable answer says nothing, so the copy stays"
+        );
+        assert_eq!(
+            world().cloudflare.secrets[SECRET_ID].value,
+            copy.value,
+            "the write had in fact applied"
+        );
+        let failed = t.audit("rotation.failed").await.expect("a rotation.failed");
+        assert!(
+            failed["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("whether it applied isn't known")),
+            "{failed}"
+        );
+
+        // And it finishes once the binding catches up.
+        world().cloudflare.bound_value = copy.value.clone();
+        cron().await;
+        t.audit("rotation.handover").await.expect("a handover");
+    }
+
+    /// The lead before an expiry has to fit another turn of the cron and the
+    /// swap's own calls, not just the drain. An overlap at its 1h floor is
+    /// exactly the cron period, so a token expiring just past it would get
+    /// seconds to be replaced in.
+    #[tokio::test]
+    async fn replaces_an_expiring_token_a_whole_cron_turn_before_it_lapses() {
+        let t = start().await;
+        clear_rotation_state();
+        {
+            let mut world = world();
+            world.cloudflare.propagate_secret = false;
+            let token = world
+                .cloudflare
+                .tokens
+                .get_mut(CLOUDFLARE_TOKEN_ID)
+                .expect("the broker's token");
+            // Young, and past the 2h overlap this policy sets, but not past
+            // an overlap plus another turn of the cron.
+            token.issued_on = Some(at(-60));
+            token.expires_on = Some(at(2 * HOUR + 30 * 60));
+        }
+
+        cron().await;
+
+        let swapped = t
+            .audit("rotation.swapped")
+            .await
+            .expect("a rotation.swapped");
+        assert_eq!(swapped["expiring"], true, "{swapped}");
+    }
+
+    /// A swap whose write was refused keeps its record until the copy is
+    /// really gone. A discard that fails would otherwise leave a token with
+    /// the broker's own permissions and nothing that knew of it.
+    #[tokio::test]
+    async fn keeps_the_record_of_a_refused_swap_until_its_copy_is_gone() {
+        let t = start().await;
+        let copy = earlier_token(BROKER_TOKEN_NAME);
+        set_rotation_state(&json!({
+            "pending": {
+                "new_token_id": copy,
+                "old_token_id": CLOUDFLARE_TOKEN_ID,
+                "at": now() as i64 - 600,
+                "attempt": "unused",
+            },
+        }));
+
+        cron().await;
+
+        // The secret is as it was, so the copy is in no one's hands: the turn
+        // deletes it and clears the record, rather than reporting a jam.
+        assert!(!has(&copy), "the copy should be discarded");
+        t.audit("rotation.voided").await.expect("a rotation.voided");
+        assert!(
+            t.audits("rotation.unsettled").await.is_empty(),
+            "a swap whose write never took isn't unsettled"
+        );
+        assert_eq!(rotation_state(), json!({}), "the record should be cleared");
+    }
+
+    /// The rotation goes before the cleanup. The cleanup lists every token and
+    /// deletes each expired one, so a backlog can spend the invocation's
+    /// subrequests; an hour of expired tokens lying about costs nothing beside
+    /// a provisioning token left to expire with nothing able to replace it.
+    #[tokio::test]
+    async fn rolls_its_own_token_before_clearing_up_after_the_others() {
+        let t = start().await;
+        clear_rotation_state();
+        world().cloudflare.propagate_secret = false;
+        // Something for the cleanup to find, so both halves have work.
+        world().cloudflare.add(
+            None,
+            "cloudflare-sts:github:1",
+            None,
+            Some(at(-60)),
+            "expired",
+        );
+        age_the_token(MONTH);
+
+        cron().await;
+
+        let rotated = t
+            .audit_order("rotation.swapped")
+            .await
+            .expect("a rotation.swapped");
+        let cleaned = t.audit_order("cleanup.done").await.expect("a cleanup.done");
+        assert!(
+            rotated < cleaned,
+            "the rotation should run first: rotation at {rotated}, cleanup at {cleaned}"
+        );
+    }
+
+    /// A copy whose create went unanswered is found by the name the broker
+    /// wrote down, even once its own hostname has changed: that name is the
+    /// broker's own record, so it's proof enough of whose the token is.
+    #[tokio::test]
+    async fn sweeps_a_copy_its_intent_names_whatever_the_prefix_says_now() {
+        let t = start().await;
+        set_rotation_state(&json!({}));
+        // Named for a host this broker no longer answers on, and with no age
+        // for Cloudflare to report: unreachable by either of the sweep's other
+        // two ways in.
+        let orphan = earlier_token("cloudflare-sts-broker:was.example.com.00000000:1700000000");
+        world()
+            .cloudflare
+            .tokens
+            .get_mut(&orphan)
+            .unwrap()
+            .issued_on = None;
+        set_creating(&json!({
+            "name": "cloudflare-sts-broker:was.example.com.00000000:1700000000",
+            "at": now() as i64 - 3 * HOUR,
+        }));
+
+        cron().await;
+
+        let swept = t.audit("rotation.swept").await.expect("a rotation.swept");
+        assert_eq!(swept["token_id"], orphan);
+        assert!(
+            !has(&orphan),
+            "the copy its intent names should be collected"
+        );
+        assert_eq!(creating_state(), json!(null), "and the intent cleared");
+    }
+
+    /// An intent is cleared once it's been answered, not once it's been around
+    /// a while: a sweep that couldn't delete the copy has to leave the only
+    /// record of it behind.
+    #[tokio::test]
+    async fn keeps_an_intent_whose_copy_it_couldnt_delete() {
+        let t = start().await;
+        set_rotation_state(&json!({}));
+        let orphan = earlier_token(BROKER_TOKEN_NAME);
+        {
+            let mut world = world();
+            world.cloudflare.tokens.get_mut(&orphan).unwrap().issued_on = None;
+            world.cloudflare.fail_token_delete = true;
+        }
+        set_creating(&json!({ "name": BROKER_TOKEN_NAME, "at": now() as i64 - 3 * HOUR }));
+        // Due as well, so a swap would be attempted — and would write its own
+        // name over the intent, losing the only way back to this copy.
+        age_the_token(MONTH);
+
+        cron().await;
+
+        assert!(
+            has(&orphan),
+            "the delete failed, so the copy is still there"
+        );
+        assert_eq!(
+            creating_state()["name"],
+            BROKER_TOKEN_NAME,
+            "the intent naming it must not be cleared on a delete that failed"
+        );
+        assert!(
+            t.audits("rotation.swapped").await.is_empty(),
+            "an unanswered intent must hold off a swap: its name is the only way back to the copy"
+        );
+        assert!(
+            broker_tokens().iter().all(|token| token.id == orphan),
+            "and so no second copy: {:?}",
+            broker_tokens()
+        );
+
+        // Once deleting works again, a later turn collects it.
+        world().cloudflare.fail_token_delete = false;
+        cron().await;
+        t.audit("rotation.swept").await.expect("a rotation.swept");
+        assert!(!has(&orphan));
+        assert_eq!(creating_state(), json!(null), "and the intent is cleared");
+    }
+
+    /// A record written before the write must not claim the secret is
+    /// untouched: a turn that stops mid-write would leave a later one deleting
+    /// a copy the secret may by then be holding.
+    #[tokio::test]
+    async fn records_a_write_it_hasnt_answered_for_as_unknown() {
+        let t = start().await;
+        clear_rotation_state();
+        {
+            let mut world = world();
+            world.cloudflare.propagate_secret = false;
+            // The write never comes back, so the record is whatever was put
+            // there before it.
+            world.cloudflare.secret_patch = SecretPatch::AppliedThenLost;
+        }
+        age_the_token(MONTH);
+
+        cron().await;
+
+        t.audit("rotation.failed").await.expect("a rotation.failed");
+        let state = rotation_state();
+        assert_eq!(
+            state["pending"]["attempt"], "uncertain",
+            "a write with no answer must leave a record that doesn't claim to know: {state}"
+        );
+        assert!(has(&the_copy().id), "and the copy stays");
+    }
+
+    /// A refused write whose copy can't be deleted must leave the record of
+    /// the copy behind. Clearing it would leave a token with the broker's own
+    /// permissions and nothing anywhere that knew of it.
+    #[tokio::test]
+    async fn keeps_the_record_when_the_copy_it_gave_up_on_cant_be_deleted() {
+        let t = start().await;
+        clear_rotation_state();
+        {
+            let mut world = world();
+            world.cloudflare.propagate_secret = false;
+            world.cloudflare.secret_patch = SecretPatch::Refused;
+            world.cloudflare.fail_token_delete = true;
+        }
+        age_the_token(MONTH);
+
+        cron().await;
+
+        let copy = the_copy();
+        assert!(
+            has(&copy.id),
+            "the discard failed, so the copy is still there"
+        );
+        let state = rotation_state();
+        assert_eq!(
+            state["pending"]["new_token_id"], copy.id,
+            "the record must outlive a discard that failed: {state}"
+        );
+        assert_eq!(state["pending"]["attempt"], "unused", "{state}");
+
+        // A later turn retries the discard. While deleting still fails, the
+        // record has to survive that too: a turn that cleared it on a delete
+        // it hadn't managed would lose the copy all over again.
+        age_the_token(0);
+        cron().await;
+        assert!(has(&copy.id), "still there, still failing to delete");
+        let state = rotation_state();
+        assert_eq!(
+            state["pending"]["new_token_id"], copy.id,
+            "a retry that failed must not clear the record either: {state}"
+        );
+
+        // Once deleting works again, the next turn finishes the job without
+        // anyone having to go and look.
+        world().cloudflare.fail_token_delete = false;
+        age_the_token(0);
+        cron().await;
+        assert!(
+            !has(&copy.id),
+            "the copy should be discarded on a later turn"
+        );
+        t.audit("rotation.voided").await.expect("a rotation.voided");
+        assert_eq!(rotation_state(), json!({}), "and the record cleared");
+    }
+
+    /// `attempt: taken` says the write went through, not that the secret still
+    /// holds the copy. A third token in the binding means something happened
+    /// that the broker didn't do, and it has to say so rather than wait.
+    #[tokio::test]
+    async fn stops_calling_it_propagation_when_a_third_token_is_bound() {
+        let t = start().await;
+        let copy = earlier_token(BROKER_TOKEN_NAME);
+        let replaced = earlier_token("the token it was replacing");
+        set_rotation_state(&json!({
+            "pending": {
+                "new_token_id": copy,
+                "old_token_id": replaced,
+                "at": now() as i64 - 600,
+                "attempt": "taken",
+            },
+        }));
+
+        cron().await;
+
+        let stuck = t.audit("rotation.stuck").await.expect("a rotation.stuck");
+        assert_eq!(stuck["bound_token_id"], CLOUDFLARE_TOKEN_ID, "{stuck}");
+        assert!(
+            t.audits("rotation.waiting").await.is_empty(),
+            "a third token isn't a slow handover"
+        );
+        assert!(has(&copy) && has(&replaced), "nothing is deleted");
+    }
+
+    /// A secret that doesn't name its own scopes must not come back with an
+    /// empty list written over it: that would say "no service may use this"
+    /// about the secret the Worker reads.
+    #[tokio::test]
+    async fn leaves_the_scopes_alone_on_a_secret_that_doesnt_name_them() {
+        let t = start().await;
+        clear_rotation_state();
+        {
+            let mut world = world();
+            world.cloudflare.propagate_secret = false;
+            world.cloudflare.secrets.get_mut(SECRET_ID).unwrap().scopes = json!(null);
+        }
+        age_the_token(MONTH);
+
+        cron().await;
+
+        // It's still found: a shape the broker didn't expect is not a secret
+        // that isn't there.
+        let swapped = t
+            .audit("rotation.swapped")
+            .await
+            .expect("a rotation.swapped");
+        assert_eq!(swapped["secret"], SECRET_NAME);
+
+        // Taken before the guard: `the_copy` locks the world too, and the lock
+        // isn't reentrant.
+        let copy = the_copy();
+        let world = world();
+        let secret = &world.cloudflare.secrets[SECRET_ID];
+        assert_eq!(secret.value, copy.value, "the copy is in the secret");
+        assert_eq!(
+            secret.scopes,
+            json!(null),
+            "scopes it didn't come back with must be left unnamed, not emptied"
+        );
+        let patch = world
+            .cloudflare
+            .requests
+            .iter()
+            .rfind(|r| r.method == "PATCH")
+            .expect("a patch");
+        assert!(
+            patch.body.as_ref().is_some_and(|b| b["scopes"].is_null()),
+            "the patch should not name scopes at all: {:?}",
+            patch.body
+        );
+    }
+
+    /// Cloudflare needn't say when a token was issued. One whose expiry is
+    /// known and close still has to be replaced, or the broker reaches the
+    /// point where it can't authenticate to replace anything.
+    #[tokio::test]
+    async fn replaces_a_token_thats_expiring_even_when_its_age_is_unknown() {
+        let t = start().await;
+        clear_rotation_state();
+        {
+            let mut world = world();
+            world.cloudflare.propagate_secret = false;
+            let token = world
+                .cloudflare
+                .tokens
+                .get_mut(CLOUDFLARE_TOKEN_ID)
+                .expect("the broker's token");
+            // Young by any reckoning, but Cloudflare doesn't say, and it runs
+            // out inside the overlap.
+            token.issued_on = None;
+            token.expires_on = Some(at(HOUR));
+        }
+
+        cron().await;
+
+        let swapped = t
+            .audit("rotation.swapped")
+            .await
+            .expect("a rotation.swapped");
+        assert_eq!(swapped["expiring"], true, "{swapped}");
+        assert_eq!(swapped["old_token_id"], CLOUDFLARE_TOKEN_ID);
+        assert!(
+            t.audits("rotation.skipped").await.is_empty(),
+            "an unknown age must not stop a known expiry being acted on"
+        );
+    }
+
+    /// A handover slower than an overlap must not cost the broker the copy
+    /// Secrets Store already holds. The record keeps naming it until the
+    /// binding catches up, which is the only thing standing between the sweep
+    /// and the live token.
+    #[tokio::test]
+    async fn never_sweeps_the_copy_while_the_binding_is_slow_to_hand_over() {
+        let t = start().await;
+        clear_rotation_state();
+        world().cloudflare.propagate_secret = false;
+        age_the_token(MONTH);
+
+        cron().await;
+        let copy = the_copy();
+        t.audit("rotation.swapped").await.expect("a swap");
+
+        // Older than an overlap and not the bound token: everything the sweep
+        // looks for, except that the record accounts for it.
+        world()
+            .cloudflare
+            .tokens
+            .get_mut(&copy.id)
+            .unwrap()
+            .issued_on = Some(at(-3 * HOUR));
+        // An intent goes in so the sweep actually runs, leaving the record as
+        // the only thing standing between it and the copy.
+        set_creating(&json!({
+            "name": "cloudflare-sts-broker:127.0.0.1.ec92f4d1:1600000000",
+            "at": now() as i64 - 3 * HOUR,
+        }));
+        cron().await;
+
+        assert!(
+            has(&copy.id),
+            "the copy Secrets Store holds must never be swept, however slow the handover"
+        );
+        assert!(t.audits("rotation.swept").await.is_empty());
+        let state = rotation_state();
+        assert_eq!(
+            state["pending"]["new_token_id"], copy.id,
+            "the record is what keeps the sweep off it: {state}"
+        );
+
+        // And it still finishes once the binding catches up.
+        world().cloudflare.bound_value = copy.value.clone();
+        cron().await;
+        t.audit("rotation.handover").await.expect("a handover");
+    }
+
+    /// A handover that never comes is a misconfigured `rotation.secret`, not a
+    /// broker that should go on waiting silently.
+    #[tokio::test]
+    async fn says_so_when_a_taken_write_never_reaches_the_binding() {
+        let t = start().await;
+        let copy = earlier_token(BROKER_TOKEN_NAME);
+        set_rotation_state(&json!({
+            "pending": {
+                "new_token_id": copy,
+                "old_token_id": CLOUDFLARE_TOKEN_ID,
+                "at": now() as i64 - 3 * HOUR,
+                "attempt": "taken",
+            },
+        }));
+
+        cron().await;
+
+        let waiting = t
+            .audit("rotation.waiting")
+            .await
+            .expect("a rotation.waiting");
+        assert_eq!(waiting["new_token_id"], copy, "{waiting}");
+        assert!(
+            waiting["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("rotation.secret")),
+            "it should say where to look: {waiting}"
+        );
+        // A write that was taken isn't unsettled: the broker knows the secret
+        // holds the copy, it's the binding that hasn't caught up.
+        assert!(t.audits("rotation.unsettled").await.is_empty());
+        assert!(has(&copy) && has(CLOUDFLARE_TOKEN_ID), "nothing is deleted");
+    }
+
+    /// Tokens are listed account-wide. A broker that swept on the bare prefix
+    /// would delete another broker's live provisioning token and take it
+    /// offline, so the name carries the host it was made by.
+    #[tokio::test]
+    async fn never_sweeps_another_brokers_token_in_the_same_account() {
+        let t = start().await;
+        clear_rotation_state();
+        let theirs =
+            earlier_token("cloudflare-sts-broker:other-sts.example.com.1234abcd:1700000000");
+        let mine = earlier_token(BROKER_TOKEN_NAME);
+
+        for id in [&theirs, &mine] {
+            world().cloudflare.tokens.get_mut(id).unwrap().issued_on = Some(at(-3 * HOUR));
+        }
+        // The intent names this broker's own copy, so the sweep both runs and
+        // deletes that one outright.
+        set_creating(&json!({ "name": BROKER_TOKEN_NAME, "at": now() as i64 - 3 * HOUR }));
+
+        cron().await;
+
+        assert!(
+            has(&theirs),
+            "another broker's live token must never be swept"
+        );
+        assert!(!has(&mine), "its own orphan still is");
+
+        let swept = t.audit("rotation.swept").await.expect("a rotation.swept");
+        assert_eq!(swept["token_id"], mine);
+        assert!(
+            t.audits("rotation.adopted").await.is_empty(),
+            "another broker's token isn't taken over either"
+        );
+    }
+
+    /// A token still draining is accounted for, so the sweep leaves it even
+    /// though it's older than an overlap and isn't the bound one. Deleting it
+    /// early would cut short the R2 credentials it fathered, which is the one
+    /// thing the drain window exists to prevent.
+    #[tokio::test]
+    async fn never_sweeps_a_token_thats_still_draining() {
+        let t = start().await;
+        let draining = earlier_token(BROKER_TOKEN_NAME);
+        world()
+            .cloudflare
+            .tokens
+            .get_mut(&draining)
+            .unwrap()
+            .issued_on = Some(at(-3 * HOUR));
+        set_rotation_state(&json!({
+            "retiring": [{ "token_id": draining, "delete_after": now() as i64 + HOUR }],
+        }));
+        // An intent outstanding, so the sweep runs and its guards are the only
+        // thing keeping it off the draining token.
+        set_creating(&json!({
+            "name": "cloudflare-sts-broker:127.0.0.1.ec92f4d1:1600000000",
+            "at": now() as i64 - 3 * HOUR,
+        }));
+
+        cron().await;
+
+        assert!(
+            has(&draining),
+            "a token still inside its drain window must not be swept away"
+        );
+        assert!(t.audits("rotation.swept").await.is_empty());
+        assert!(t.audits("rotation.retired").await.is_empty());
+    }
+
+    /// A rollback whose record of itself didn't survive — Workers KV takes one
+    /// write per key per second, so the write that was to clear it can be
+    /// refused. Asking Cloudflare what still exists is what gets the broker
+    /// going again without a person.
+    #[tokio::test]
+    async fn clears_a_swap_whose_copy_no_longer_exists() {
+        let t = start().await;
+        set_rotation_state(&json!({
+            "pending": {
+                "new_token_id": "tok-deleted-copy",
+                "old_token_id": CLOUDFLARE_TOKEN_ID,
+                "at": now() as i64 - 600,
+            },
+        }));
+
+        cron().await;
+
+        let line = t.audit("rotation.voided").await.expect("a rotation.voided");
+        assert!(
+            line["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("never took")),
+            "{line}"
+        );
+        assert!(
+            t.audits("rotation.unsettled").await.is_empty(),
+            "a swap whose copy is gone isn't unsettled, it's void"
+        );
+        assert_eq!(rotation_state(), json!({}), "the record should be cleared");
+
+        // And it isn't jammed: the next turn is free to roll again.
+        age_the_token(MONTH);
+        cron().await;
+        t.audit("rotation.swapped")
+            .await
+            .expect("a rotation.swapped");
+    }
+
+    /// A turn died mid-swap and the binding hands over neither token, so which
+    /// of the two Secrets Store holds can't be told from here. Deleting the
+    /// wrong one would brick the broker, so it deletes neither and says so.
+    #[tokio::test]
+    async fn changes_nothing_when_it_cant_tell_which_token_a_swap_left_bound() {
+        let t = start().await;
+        let copy = earlier_token(BROKER_TOKEN_NAME);
+        let old = earlier_token("the hand-made token");
+        set_rotation_state(&json!({
+            "pending": { "new_token_id": copy, "old_token_id": old, "at": now() as i64 - 600 },
+        }));
+
+        cron().await;
+
+        let stuck = t.audit("rotation.stuck").await.expect("a rotation.stuck");
+        assert_eq!(stuck["new_token_id"], copy);
+        assert_eq!(stuck["old_token_id"], old);
+        assert_eq!(
+            stuck["bound_token_id"], CLOUDFLARE_TOKEN_ID,
+            "it should say which token the binding does hand over"
+        );
+        assert!(
+            stuck["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("delete the other")),
+            "it should say what to do: {stuck}"
+        );
+        assert!(has(&copy) && has(&old), "neither token should be deleted");
+
+        // And there it stays: due or not, nothing else happens until a person
+        // clears the key.
+        age_the_token(MONTH);
+        cron().await;
+        assert!(
+            t.audits("rotation.swapped").await.is_empty(),
+            "a swap it can't account for should hold off the next"
+        );
+    }
+}
