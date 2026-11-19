@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.2](https://github.com/cf-contrib/cloudflare-sts/compare/v0.23.1...v0.23.2) (2026-11-19)
+
+
+### Bug Fixes
+
+* send Cache-Control no-store with the token response ([#140](https://github.com/cf-contrib/cloudflare-sts/issues/140)) ([c9705ca](https://github.com/cf-contrib/cloudflare-sts/commit/c9705ca96650d9c48bce8b09ffdd9b23f5d26e32))
+
 ## [0.23.1](https://github.com/cf-contrib/cloudflare-sts/compare/v0.23.0...v0.23.1) (2026-11-16)
 
 
