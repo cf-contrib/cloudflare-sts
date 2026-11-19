@@ -36,7 +36,23 @@
             # The Rust Worker.
             pkgs.pkg-config
             # nixpkgs builds the -sys crates against the libraries of the system, since its November release, and zstd-sys finds no libzstd: it builds its own
-            (pkgs.worker-build.overrideAttrs { dontCargoUseSystemLibs = true; })
+            (pkgs.worker-build.overrideAttrs (old: rec {
+              # nixpkgs has 0.8.7, which refuses worker 0.9.
+              version = "0.9.0";
+              src = pkgs.fetchFromGitHub {
+                owner = "cloudflare";
+                repo = "workers-rs";
+                tag = "v${version}";
+                hash = "sha256-zmeQp7db2rwfECp9p5NthKvzsZFnQPFO+eueIhFsIwE=";
+                fetchSubmodules = true;
+              };
+              cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+                inherit src;
+                name = "worker-build-${version}-vendor";
+                hash = "sha256-EbRwSrxRys2EcDfB88apmH5Rm0NUWLKtmGPS77fAhpI=";
+              };
+              dontCargoUseSystemLibs = true;
+            }))
             rust-toolchain
             # Both.
             pkgs.wrangler
