@@ -53,6 +53,9 @@ by default deploys the broker of the release its `ref` points to.
   their parent (see [Buckets](../../crates/cloudflare-sts-api#buckets)).
   If any profile has an `access`, it also needs **Access: Service Tokens Write**
   (see [Access service tokens](../../crates/cloudflare-sts-api#access-service-tokens)).
+  With `token_rotation` enabled, it also needs **Secrets Store Write**, to find
+  and rewrite its own secret (see
+  [Rotating the Cloudflare token](../../crates/cloudflare-sts-api#rotating-the-cloudflare-token)).
 - A separate API token for *deploying*, exported as `CLOUDFLARE_API_TOKEN`, with:
   - **Account → Workers Scripts: Edit**
   - **Account → Secrets Store: Edit**, to bind the Cloudflare token's secret
@@ -81,7 +84,22 @@ curl -fsS "$(tofu output -raw cloudflare_sts_api_url)/health/ready"   # 500 if t
 
 Terraform only references the secret by store ID and name. The token's value
 never enters Terraform state or the plan. Rotate it by replacing the secret in
-Secrets Store; the broker reads it on every request.
+Secrets Store; the broker reads it on every request. Or set `token_rotation`
+and have the broker replace it for you:
+
+```hcl
+token_rotation = {
+  enabled = true
+  every   = "30d" # how old the Cloudflare token may get
+  overlap = "25h" # how long the one it replaces stays alive after the handover
+}
+```
+
+The module points it at the same secret as the binding, so the two can't name
+different ones. The broker's token then needs **Secrets Store Write**, and on an
+existing deployment this goes in a [second apply](#upgrading-and-pinning). What
+it does, and why it replaces the token rather than rolling it in place, is in
+the [broker's README](../../crates/cloudflare-sts-api#rotating-the-cloudflare-token).
 
 ### Checking it's ready
 
@@ -322,6 +340,44 @@ curl -fsSL https://github.com/cf-contrib/cloudflare-sts/releases/download/v0.23.
 
 Set `release_tag = "latest"` to track the newest release instead.
 
+**Turning on `token_rotation` takes two applies.** The policy goes into Workers
+KV before the new Worker version is promoted, and a Worker that predates
+`rotation` refuses a policy with a field it doesn't know, so a single apply that
+both upgrades the broker and enables rotation can leave the running Worker
+failing every request until the deployment catches up — or for good, if the
+apply fails in between.
+
+First bump the `ref` and apply, leaving `token_rotation` out:
+
+```hcl
+module "cloudflare_sts_api" {
+  source = "git::https://github.com/cf-contrib/cloudflare-sts.git//deployment/terraform?ref=v0.23.2" # x-release-please-version
+  # ...
+}
+```
+
+```sh
+tofu init -upgrade && tofu apply
+curl -fsS "$(tofu output -raw cloudflare_sts_api_url)/health/ready"
+```
+
+Then, once it's serving, add the input to the same block and apply again:
+
+```hcl
+module "cloudflare_sts_api" {
+  # ...
+  token_rotation = { enabled = true }
+}
+```
+
+It goes in the module block rather than on the command line: `token_rotation` is
+this module's input, and `-var` sets a root variable, so it would either fail as
+undeclared or quietly leave rotation off. Putting it in the block is also what
+makes it stick for the next apply.
+
+A deployment already on a version that understands `rotation` can enable it in
+one apply. The same goes for any later release that adds a policy field.
+
 Upgrading from 0.22: the Worker no longer has a signing key, so delete any
 `signing_key_secret` you passed and the secret it named, and drop `audience`
 from profiles (use `access` to reach an application behind Access). A provider
@@ -356,6 +412,7 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
 | `hostname` | yes | | `<worker_name>.<subdomain>.workers.dev`, or a custom domain. |
 | `zone_id` | for a custom domain | `null` | Zone ID of the zone holding a custom-domain `hostname`. |
 | `cloudflare_token_secret` | yes | | `{ secret_store_id, secret_name }` of the Secrets Store secret holding the Cloudflare token. With a profile's `bucket`, the token also needs R2 permissions covering what it delegates. |
+| `token_rotation` | no | `null` | `{ enabled, every?, overlap? }`: have the broker replace its own Cloudflare token, into the secret above. `every` defaults to `30d`, `overlap` to `25h`; the overlap must be longer than the longest `max_ttl` a profile hands out, and at most half of `every`. The broker's token then needs **Secrets Store Write**. Enable it in a [second apply](#upgrading-and-pinning). See [Rotating the Cloudflare token](../../crates/cloudflare-sts-api#rotating-the-cloudflare-token). |
 | `oidc_providers` | yes | | The OIDC issuers the broker trusts: `{ name, issuer, audience?, jwks_uri?, typ? }` each. `audience` defaults to the broker's URL; for [people](../../crates/cloudflare-sts-api#people) it is the client they sign in as. See [Policy](#policy). |
 | `profiles` | yes | | What callers may get, in the configuration's format: `name`, `provider`, `forward_claims`, `token`, `bucket`, `access`, `ttl`, `max_ttl`, `enabled`. See [Policy](#policy). |
 | `cedar_policy` | yes | | Who gets what: Cedar text with a permit for `Admit::Action::"<provider>"` for every provider, pinning your org, and `Profile::Action::"<name>"` for every profile, each with an `@id`. See [Policy](#policy). |
@@ -385,4 +442,6 @@ worker-build --release   # worker_dir = ".../crates/cloudflare-sts-api/build"
   checks the bindings (the Cloudflare token's),
   both URL modes and the `hostname` and `zone_id` checks, local artifacts,
   checksums, and the policy built from its variables: what it fills in, what it
-  leaves out, and its size.
+  leaves out, its size, and that `token_rotation` reaches the policy naming the
+  secret the Worker is bound to, with the periods it would refuse rejected in
+  the plan rather than by the broker.

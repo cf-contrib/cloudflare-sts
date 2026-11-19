@@ -47,6 +47,12 @@ pub const CACHE: &str = "https://cloudflare-nix-api.example.com";
 pub const CLOUDFLARE_TOKEN: &str = "test-cloudflare-token";
 pub const CLOUDFLARE_TOKEN_ID: &str = "tok-cloudflare";
 
+/// The Secrets Store secret it lives in: the store and name `wrangler.toml`
+/// binds, and `tests/config.toml` names for the rotation to write back to.
+pub const SECRET_STORE_ID: &str = "00000000000000000000000000000000";
+pub const SECRET_NAME: &str = "cloudflare-token";
+pub const SECRET_ID: &str = "sec-cloudflare-token";
+
 pub const GRANT: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub const ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
 pub const ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
@@ -82,7 +88,7 @@ pub struct World {
 }
 
 impl World {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             cloudflare: FakeCloudflare::new(),
         }
@@ -176,6 +182,15 @@ impl Test {
             .into_iter()
             .filter(|l| l["event"] == event)
             .collect()
+    }
+
+    /// Where `event` first shows up in the log since the test began, so a
+    /// test can say which of two things the Worker did first.
+    pub async fn audit_order(&self, event: &str) -> Option<usize> {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.audit_lines()
+            .into_iter()
+            .position(|line| line["event"] == event)
     }
 
     pub async fn deny(&self) -> Value {
@@ -456,7 +471,24 @@ pub struct StoredToken {
     pub value: String,
     pub status: String,
     pub expires_on: Option<String>,
+    /// When Cloudflare says it was issued, which is how the rotation tells its
+    /// age. `None` for a token it doesn't say about: the field is optional, and
+    /// a token with no age still has an expiry worth acting on.
+    pub issued_on: Option<String>,
     pub policies: Value,
+}
+
+/// A secret in the account's Secrets Store, as the API sees it. The Worker's
+/// binding only ever reads one; this is what the broker writes to when it
+/// replaces its own Cloudflare token.
+#[derive(Clone, Debug)]
+pub struct StoredSecret {
+    pub id: String,
+    pub name: String,
+    pub value: String,
+    /// `Value::Null` for a secret that doesn't name its own.
+    pub scopes: Value,
+    pub comment: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -478,14 +510,48 @@ pub struct StoredServiceToken {
     pub tags: Value,
 }
 
+/// How the stand-in answers a write to a Secrets Store secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretPatch {
+    /// It takes, and says so.
+    Takes,
+    /// Cloudflare refuses it and says so: the secret is unchanged, and the
+    /// caller may act on that.
+    Refused,
+    /// It fails in a way that can't say whether it applied.
+    Unanswerable,
+    /// It applies, and then the answer is lost. The case a caller that treats
+    /// every failure as a refusal gets wrong: the secret now holds the new
+    /// value, so discarding it would take the broker down as it propagates.
+    AppliedThenLost,
+    /// It applies, and answers `200` with a body that isn't JSON. Cloudflare
+    /// said nothing a caller can read, which is not the same as saying no.
+    AppliedThenUnreadable,
+}
+
 /// Cloudflare's account tokens API, permission groups, R2 temporary credentials and Access service tokens, in memory.
 pub struct FakeCloudflare {
     pub tokens: BTreeMap<String, StoredToken>,
     pub service_tokens: BTreeMap<String, StoredServiceToken>,
+    /// The account's Secrets Store secrets, by ID.
+    pub secrets: BTreeMap<String, StoredSecret>,
+    /// What the Worker's Secrets Store binding hands over. `wrangler dev`
+    /// serves a fixed value from its local store, so the Worker always presents
+    /// [`CLOUDFLARE_TOKEN`]; this is what Cloudflare resolves that to, which is
+    /// how a patched secret shows up as a different token on `verify`.
+    pub bound_value: String,
+    /// Whether patching the bound secret reaches the binding. Off, the Worker
+    /// goes on holding the token it had, as it would while a write propagates
+    /// or if the policy named the wrong secret.
+    pub propagate_secret: bool,
     pub requests: Vec<CloudflareRequest>,
     pub fail_create: bool,
     pub fail_r2: bool,
     pub fail_access: bool,
+    pub secret_patch: SecretPatch,
+    /// Whether deleting a token fails. Lets a test leave a copy behind that
+    /// the broker meant to discard.
+    pub fail_token_delete: bool,
     seq: u32,
 }
 
@@ -514,15 +580,128 @@ fn api_error(status: u16, message: &str) -> Response {
     )
 }
 
+/// An RFC 3339 timestamp `offset` seconds from now, as Cloudflare writes them.
+pub fn at(offset: i64) -> String {
+    chrono::DateTime::from_timestamp(now() as i64 + offset, 0)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Where `tests/run.sh` persists the local KV namespace and Secrets Store.
+const PERSIST: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.wrangler/integration");
+
+/// Puts the broker's rotation state in the `rotation` key of the local KV
+/// namespace, where the Worker keeps it.
+///
+/// `wrangler dev` reads the same persisted store as it runs, so a test can
+/// start the broker mid-rotation: the states a swap reaches only across turns
+/// of the cron, or hours later when an overlap runs out, or after a turn died
+/// in the middle. Every rotation test sets it, so none inherits the last one's.
+/// The broker's rotation state, as it has written it: `{}` when it has
+/// written nothing. Lets a test see the record the broker keeps, not only what
+/// it did to Cloudflare.
+pub fn rotation_state() -> Value {
+    get_kv("rotation")
+}
+
+fn get_kv(key: &str) -> Value {
+    let output = std::process::Command::new("wrangler")
+        .args([
+            "kv",
+            "key",
+            "get",
+            key,
+            "--text",
+            "--binding",
+            "CLOUDFLARE_STS_API_POLICY_KV",
+            "--local",
+            "--persist-to",
+            PERSIST,
+            "--cwd",
+            env!("CARGO_MANIFEST_DIR"),
+        ])
+        .output()
+        .expect("wrangler should run: the integration tests need it on PATH");
+    assert!(
+        output.status.success(),
+        "reading `{key}` failed: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Wrangler prints the value with its own chatter around it; the state is
+    // the one JSON object in there.
+    let (start, end) = (text.find('{'), text.rfind('}'));
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            serde_json::from_str(&text[start..=end]).unwrap_or_else(|why| {
+                panic!(
+                    "the rotation state should be JSON: {why}: {:?}",
+                    &text[start..=end]
+                )
+            })
+        }
+        // Nothing there, or nothing but the chatter: the broker writes a key
+        // it has nothing to say about as empty.
+        _ => Value::Null,
+    }
+}
+
+/// Puts the broker's creation intent in the `rotation.creating` key, which it
+/// keeps apart from the rest so the two writes a swap makes can't be taken for
+/// one key written twice in a second.
+pub fn set_creating(creating: &Value) {
+    put_kv("rotation.creating", &creating.to_string());
+}
+
+/// The creation intent as the broker has written it.
+pub fn creating_state() -> Value {
+    get_kv("rotation.creating")
+}
+
+pub fn set_rotation_state(state: &Value) {
+    put_kv("rotation", &state.to_string());
+}
+
+fn put_kv(key: &str, value: &str) {
+    let output = std::process::Command::new("wrangler")
+        .args([
+            "kv",
+            "key",
+            "put",
+            key,
+            value,
+            "--binding",
+            "CLOUDFLARE_STS_API_POLICY_KV",
+            "--local",
+            "--persist-to",
+            PERSIST,
+            "--cwd",
+            env!("CARGO_MANIFEST_DIR"),
+        ])
+        .output()
+        .expect("wrangler should run: the integration tests need it on PATH");
+    assert!(
+        output.status.success(),
+        "setting `{key}` failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 impl FakeCloudflare {
     fn new() -> Self {
         let mut fake = Self {
             tokens: BTreeMap::new(),
             service_tokens: BTreeMap::new(),
+            secrets: BTreeMap::new(),
+            bound_value: CLOUDFLARE_TOKEN.into(),
+            propagate_secret: true,
             requests: Vec::new(),
             fail_create: false,
             fail_r2: false,
             fail_access: false,
+            secret_patch: SecretPatch::Takes,
+            fail_token_delete: false,
             seq: 0,
         };
         fake.add(
@@ -532,10 +711,23 @@ impl FakeCloudflare {
             None,
             "active",
         );
+        // The secret `wrangler.toml` binds the Worker to, as Secrets Store has
+        // it: the broker writes its replacement token here.
+        fake.secrets.insert(
+            SECRET_ID.into(),
+            StoredSecret {
+                id: SECRET_ID.into(),
+                name: SECRET_NAME.into(),
+                value: CLOUDFLARE_TOKEN.into(),
+                scopes: json!(["workers"]),
+                comment: Some("the broker's Cloudflare token".into()),
+            },
+        );
         fake
     }
 
-    /// Adds a token, and returns it.
+    /// Adds a token, and returns it. Issued now, so nothing the tests add is
+    /// old enough to be rolled unless they say so.
     pub fn add(
         &mut self,
         id: Option<&str>,
@@ -556,6 +748,7 @@ impl FakeCloudflare {
             name: name.into(),
             status: status.into(),
             expires_on,
+            issued_on: Some(at(0)),
             policies: json!([]),
         };
         self.tokens.insert(id, token.clone());
@@ -591,7 +784,20 @@ impl FakeCloudflare {
     }
 
     fn view(token: &StoredToken) -> Value {
-        json!({ "id": token.id, "name": token.name, "status": token.status, "expires_on": token.expires_on, "policies": token.policies })
+        json!({ "id": token.id, "name": token.name, "status": token.status, "expires_on": token.expires_on, "issued_on": token.issued_on, "policies": token.policies })
+    }
+
+    fn secret_view(secret: &StoredSecret) -> Value {
+        json!({
+            "id": secret.id,
+            "name": secret.name,
+            "store_id": SECRET_STORE_ID,
+            "scopes": secret.scopes,
+            "comment": secret.comment,
+            "status": "active",
+            "created": at(-86_400),
+            "modified": at(0),
+        })
     }
 
     fn handle(
@@ -615,7 +821,15 @@ impl FakeCloudflare {
         }
         // Everything below takes the Cloudflare token, except verify, which takes the presented one.
         if method == Method::GET && path == format!("{acct}/tokens/verify") {
-            return match self.tokens.values().find(|t| t.value == auth) {
+            // The Worker presents whatever its binding holds, which `wrangler
+            // dev` keeps fixed; `bound_value` is what Secrets Store would hand
+            // over by now, so a patched secret shows up here as its new token.
+            let presented = if auth == CLOUDFLARE_TOKEN {
+                self.bound_value.clone()
+            } else {
+                auth.to_string()
+            };
+            return match self.tokens.values().find(|t| t.value == presented) {
                 Some(t) => {
                     envelope(json!({ "id": t.id, "status": t.status, "expires_on": t.expires_on }))
                 }
@@ -624,6 +838,62 @@ impl FakeCloudflare {
         }
         if auth != CLOUDFLARE_TOKEN {
             return api_error(403, "Unauthorized");
+        }
+
+        // Secrets Store: listing the account's secrets to find one by name, and
+        // patching its value. The broker never reads a value back.
+        let secrets = format!("{acct}/secrets_store/stores/{SECRET_STORE_ID}/secrets");
+        if method == Method::GET && path == secrets {
+            let page = query
+                .get("page")
+                .and_then(|p| p.parse::<u32>().ok())
+                .unwrap_or(1);
+            let search = query.get("search").cloned().unwrap_or_default();
+            let all: Vec<Value> = self
+                .secrets
+                .values()
+                .filter(|s| search.is_empty() || s.name.contains(&search))
+                .map(Self::secret_view)
+                .collect();
+            return envelope(if page > 1 { json!([]) } else { json!(all) });
+        }
+        if let Some(id) = path.strip_prefix(&format!("{secrets}/"))
+            && method == Method::PATCH
+        {
+            // Refused outright: nothing is written, and Cloudflare says so.
+            if self.secret_patch == SecretPatch::Refused {
+                return api_error(403, "Unauthorized");
+            }
+            if self.secret_patch == SecretPatch::Unanswerable {
+                return api_error(500, "Internal Server Error");
+            }
+            let Some(secret) = self.secrets.get_mut(id) else {
+                return api_error(404, "Not found");
+            };
+            let body = body.unwrap_or_default();
+            if let Some(value) = body["value"].as_str() {
+                secret.value = value.into();
+            }
+            // A patch that doesn't name scopes leaves them as they were.
+            if !body["scopes"].is_null() {
+                secret.scopes = body["scopes"].clone();
+            }
+            if let Some(comment) = body["comment"].as_str() {
+                secret.comment = Some(comment.into());
+            }
+            let (value, view) = (secret.value.clone(), Self::secret_view(secret));
+            if self.propagate_secret {
+                self.bound_value = value;
+            }
+            // Applied, and then the answer goes missing.
+            if self.secret_patch == SecretPatch::AppliedThenLost {
+                return api_error(500, "Internal Server Error");
+            }
+            // Applied, and answered with something unreadable.
+            if self.secret_patch == SecretPatch::AppliedThenUnreadable {
+                return (StatusCode::OK, "<html>not json at all</html>").into_response();
+            }
+            return envelope(view);
         }
 
         if method == Method::POST && path == format!("{acct}/tokens") {
@@ -730,6 +1000,9 @@ impl FakeCloudflare {
                 return envelope(Self::view(&token));
             }
             if method == Method::DELETE {
+                if self.fail_token_delete {
+                    return api_error(500, "Internal Server Error");
+                }
                 self.tokens.remove(id);
                 return envelope(json!({ "id": token.id }));
             }

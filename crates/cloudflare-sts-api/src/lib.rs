@@ -35,6 +35,7 @@ use crate::service::{
     handler::{DiscoveryServiceHandler, TokenServiceHandler},
     health::ConfigCheck,
     layer::{AuthenticateLayer, OAuthResponseLayer, cache_publicly},
+    rotate::rotate,
 };
 
 /// Logs as JSON lines, one per event with its fields at the top level, which
@@ -91,14 +92,31 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<HttpResponse
     Ok(router.call(req).await?)
 }
 
-/// The hourly cleanup of expired `cloudflare-sts:` tokens.
+/// The hourly cron: where the policy asks for it, rolling the broker's own
+/// Cloudflare token, and then the cleanup of expired `cloudflare-sts:` tokens.
+/// They're independent, so one that fails doesn't cost the other its turn.
+///
+/// The rotation goes first because it's the half whose failure can't be made
+/// good later. The cleanup lists every token and deletes each expired one, so
+/// a large backlog can spend the invocation's subrequest budget; missing a
+/// cleanup costs an hour of expired tokens lying about, where missing a
+/// rotation can leave the broker's own token to expire with nothing able to
+/// replace it.
 #[event(scheduled)]
 async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
-    let deleted = match Config::load(&env).await {
-        Ok(config) => TokenServiceHandler::new(Arc::new(config)).cleanup().await,
-        Err(err) => Err(v1::Error::new(ErrorCode::ServerError, err.to_string())),
+    let config = match Config::load(&env).await {
+        Ok(config) => Arc::new(config),
+        Err(err) => {
+            error!(event = "cron.failed", message = %err);
+            return;
+        }
     };
-    match deleted {
+
+    if let Err(why) = rotate(&env, &config).await {
+        error!(event = "rotation.failed", message = %why);
+    }
+
+    match TokenServiceHandler::new(config.clone()).cleanup().await {
         Ok(deleted) => info!(event = "cleanup.done", deleted),
         Err(err) => error!(
             event = "cleanup.failed",

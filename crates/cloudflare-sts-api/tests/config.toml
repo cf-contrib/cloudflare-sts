@@ -5,6 +5,15 @@ issuer = "http://127.0.0.1:8790"
 ttl = "15m"
 max_ttl = "1h"
 
+# The broker replaces its own Cloudflare token: the secret here is the one
+# wrangler.toml binds it to. 2h of overlap outlasts the longest max_ttl the
+# profiles below hand out, which is the defaults' 1h.
+[rotation]
+enabled = true
+every = "30d"
+overlap = "2h"
+secret = { store_id = "00000000000000000000000000000000", name = "cloudflare-token" }
+
 [[providers]]
 name = "github"
 issuer = "http://127.0.0.1:8791/issuers/actions"

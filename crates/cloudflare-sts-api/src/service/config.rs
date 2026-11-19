@@ -44,8 +44,9 @@ use crate::oidc::{Provider, Providers, check_url};
 /// minted in.
 const ACCOUNT_KEY: &str = "CLOUDFLARE_STS_API_ACCOUNT_ID";
 
-/// The Workers KV binding the policy is read from.
-const POLICY_BINDING: &str = "CLOUDFLARE_STS_API_POLICY_KV";
+/// The Workers KV binding the policy is read from, and the rotation state is
+/// kept in.
+pub(super) const POLICY_BINDING: &str = "CLOUDFLARE_STS_API_POLICY_KV";
 
 /// The keys in that namespace: the configuration, TOML (or JSON), and the
 /// Cedar policy.
@@ -75,12 +76,34 @@ const CLOUDFLARE_R2_SCOPE: &str = "com.cloudflare.edge.r2.bucket";
 const SECOND: u64 = 1000;
 const MINUTE: u64 = 60 * SECOND;
 const HOUR: u64 = 60 * MINUTE;
+const DAY: u64 = 24 * HOUR;
 
 /// The shortest TTL anything is issued for.
 const MIN_TTL: u64 = MINUTE;
 const MAX_TTL: u64 = 24 * HOUR;
 const DEFAULT_TTL: u64 = 15 * MINUTE;
 const DEFAULT_MAX_TTL: u64 = HOUR;
+
+/// How often the Cloudflare token may be rolled, at the most and at the least:
+/// often enough to be worth it, rarely enough not to churn a credential every
+/// deployment depends on.
+const MIN_ROTATION_EVERY: u64 = DAY;
+const MAX_ROTATION_EVERY: u64 = 365 * DAY;
+
+/// The shortest overlap between the old Cloudflare token and its replacement:
+/// one turn of the hourly cron, so the retire step gets at least one chance to
+/// see that Secrets Store has handed the new one over.
+const MIN_ROTATION_OVERLAP: u64 = HOUR;
+
+const HEX_CHARS: &[char] = &[
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'A', 'B', 'C',
+    'D', 'E', 'F',
+];
+
+/// Determine if the supplied character is a valid hexadecimal character.
+fn is_hex_char(value: char) -> bool {
+    HEX_CHARS.contains(&value)
+}
 
 /// What the Worker is configured with, from its bindings.
 pub struct Config {
@@ -305,6 +328,10 @@ pub struct PolicyConfig {
     #[serde(default)]
     defaults: DefaultsConfig,
     pub profiles: Vec<ProfileConfig>,
+    /// Whether, and how often, the broker rolls its own Cloudflare token. Left
+    /// out, it never does.
+    #[serde(default)]
+    rotation: Option<RotationConfig>,
     /// Who gets what. Not in the TOML.
     #[serde(skip)]
     authz: Authz,
@@ -343,6 +370,16 @@ impl PolicyConfig {
         self.authz.admit(provider, claims)
     }
 
+    /// How the broker rolls its own Cloudflare token, if it's been asked to.
+    ///
+    /// Only ever a rotation `check` has passed, so what it names is there: a
+    /// policy that loaded with an enabled rotation had one it could roll.
+    pub fn rotation(&self) -> Option<&RotationConfig> {
+        self.rotation
+            .as_ref()
+            .filter(|rotation| rotation.enabled && rotation.secret.is_some())
+    }
+
     /// What deserializing can't check, filling in each profile's provider and
     /// TTLs on the way.
     fn check(&mut self, account_id: &str) -> Result<(), String> {
@@ -378,6 +415,34 @@ impl PolicyConfig {
             }
             profile.resolve(&at, &self.providers, &defaults)?;
             profile.check(&at, &self.issuer, account_id)?;
+        }
+
+        // After the profiles: the overlap is checked against the longest TTL
+        // any of them hands out.
+        //
+        // A rotation that's `enabled` has to be right, so a bad one is
+        // refused. One that isn't only gets a warning: it rolls nothing, and
+        // an opt-in nobody opted into has no business taking every request
+        // down with it. The deployment still hears about it before it's
+        // switched on.
+        if let Some(rotation) = &self.rotation {
+            let longest = self
+                .profiles
+                .iter()
+                .filter(|profile| profile.enabled)
+                .map(|profile| profile.max_ttl)
+                .max()
+                .unwrap_or(defaults.max_ttl);
+            match (rotation.check("rotation", longest), rotation.enabled) {
+                (Ok(()), _) => {}
+                (Err(why), true) => return Err(why),
+                (Err(why), false) => warn!(
+                    event = "rotation.unusable",
+                    message = %why,
+                    detail = "rotation is switched off, so this is only refused once it's \
+                              switched on",
+                ),
+            }
         }
         Ok(())
     }
@@ -508,6 +573,120 @@ impl DefaultsConfig {
         let max_ttl = nonzero_or(self.max_ttl, DEFAULT_MAX_TTL);
         let ttl = nonzero_or(self.ttl, DEFAULT_TTL.min(max_ttl));
         Self { ttl, max_ttl }
+    }
+}
+
+/// The policy's `rotation`: whether the broker rolls its own Cloudflare token,
+/// how old it may get, and how long the one it replaces stays alive.
+///
+/// Opt-in: without `enabled`, the table is read and checked but nothing is
+/// rolled, so a deployment can carry the settings before it turns them on.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationConfig {
+    /// Whether to roll at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How old the Cloudflare token may get before it's replaced, in
+    /// milliseconds. Written as a duration, `30d` or `720h`.
+    #[serde(default, deserialize_with = "lenient_duration")]
+    pub every: u64,
+    /// How long the replaced token stays alive after the binding is seen to
+    /// hand over its replacement, in milliseconds: long enough for the R2
+    /// credentials it fathered to expire, since deleting it takes them with
+    /// it.
+    #[serde(default, deserialize_with = "lenient_duration")]
+    pub overlap: u64,
+    /// The Secrets Store secret holding the Cloudflare token: the same one the
+    /// Worker's binding reads, which only its store and name identify.
+    ///
+    /// Optional to deserialize so that leaving it out of a `rotation` nobody
+    /// has switched on is a warning rather than a refused policy. `check`
+    /// requires it.
+    #[serde(default)]
+    pub secret: Option<RotationSecret>,
+}
+
+impl RotationConfig {
+    /// That it can roll, and that the overlap outlives what the profiles hand
+    /// out: `longest` is the longest `max_ttl` among them, which is as long as
+    /// an R2 credential fathered by the old token can live.
+    fn check(&self, at: &str, longest: u64) -> Result<(), String> {
+        // Zero is also what a duration that couldn't be read comes out as, so
+        // the message says what the field should hold either way.
+        if self.every < MIN_ROTATION_EVERY {
+            return Err(format!(
+                "{at}.every must be a duration of at least 1d, such as 30d or 720h"
+            ));
+        }
+
+        if self.every > MAX_ROTATION_EVERY {
+            return Err(format!("{at}.every must be at most 365d"));
+        }
+
+        if self.overlap < MIN_ROTATION_OVERLAP {
+            return Err(format!(
+                "{at}.overlap must be a duration of at least 1h, such as 25h"
+            ));
+        }
+
+        if self.overlap <= longest {
+            return Err(format!(
+                "{at}.overlap must be longer than the longest max_ttl a profile hands out, \
+                 or deleting the replaced token would cut short the R2 credentials it \
+                 is the parent of"
+            ));
+        }
+
+        if self.overlap > self.every / 2 {
+            return Err(format!("{at}.overlap must be at most half of {at}.every"));
+        }
+
+        let Some(secret) = &self.secret else {
+            return Err(format!(
+                "{at}.secret must name the Secrets Store secret the Worker is bound to"
+            ));
+        };
+        secret.check(&format!("{at}.secret"))
+    }
+}
+
+/// Where the Cloudflare token is kept: what the Worker's Secrets Store binding
+/// points at, said again so the broker can write to it over the API, which the
+/// binding itself can't do.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationSecret {
+    /// Its name in that store. The broker looks its ID up by this.
+    ///
+    /// Defaulted rather than required, as `store_id` is, so that half a secret
+    /// in a `rotation` nobody has switched on is a warning rather than a
+    /// refused policy — as leaving the table out altogether is. `check`
+    /// requires both.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub name: String,
+    /// The store it's in.
+    #[serde(default, deserialize_with = "lenient_string")]
+    pub store_id: String,
+}
+
+impl RotationSecret {
+    fn check(&self, at: &str) -> Result<(), String> {
+        let hex = self.store_id.len() == 32 && self.store_id.chars().all(is_hex_char);
+
+        if !hex {
+            return Err(format!("{at}.store_id must be 32 lowercase hex characters"));
+        }
+
+        // It goes in a query string as it is, so it's held to the same
+        // character set as the other names the broker puts in a URL.
+        if !is_name(&self.name, &['_', '.', '-'], 255) {
+            return Err(format!(
+                "{at}.name must be 1-255 of [A-Za-z0-9_.-], starting with a letter or digit"
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -1252,14 +1431,141 @@ fn check_ttls(at: &str, ttl: u64, max_ttl: u64) -> Result<(), String> {
 fn duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let value = String::deserialize(deserializer)?;
     parse_duration(&value).ok_or_else(|| {
-        serde::de::Error::custom(format!("{value} must be a duration such as 15m or 1h30m"))
+        serde::de::Error::custom(format!(
+            "{value} must be a duration such as 15m, 1h30m or 30d"
+        ))
     })
 }
 
-/// `90s`, `15m`, `1h30m` in milliseconds, or `None` for anything else, zero
-/// included.
+/// A duration that doesn't fail the whole policy when it's nonsense: zero
+/// instead, which [`RotationConfig::check`] turns into a message naming the
+/// field.
+///
+/// Only `rotation` reads durations this way. It's opt-in, so a value nobody
+/// has switched on has no business refusing a policy and taking every request
+/// with it; a `rotation` that is switched on is still refused, by `check`.
+///
+/// Anything that isn't a duration reads as zero, whatever shape it is: a
+/// number, a list, a table. Whether TOML or JSON is being read, the visitor
+/// sees the same data model, so neither can fail the policy over it.
+fn lenient_duration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    deserializer.deserialize_any(LenientDuration)
+}
+
+/// A string that doesn't fail the whole policy when it isn't one: empty
+/// instead, which [`RotationSecret::check`] turns into a message naming the
+/// field. The `rotation` table's own, for the same reason its durations are
+/// read leniently.
+fn lenient_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    deserializer.deserialize_any(LenientString)
+}
+
+struct LenientString;
+
+impl<'de> serde::de::Visitor<'de> for LenientString {
+    type Value = String;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a string")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<String, E> {
+        Ok(value.to_string())
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<String, E> {
+        Ok(String::new())
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<String, E> {
+        Ok(String::new())
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<String, E> {
+        Ok(String::new())
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<String, E> {
+        Ok(String::new())
+    }
+
+    fn visit_unit<E>(self) -> Result<String, E> {
+        Ok(String::new())
+    }
+
+    fn visit_none<E>(self) -> Result<String, E> {
+        Ok(String::new())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<String, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(String::new())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<String, A::Error> {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(String::new())
+    }
+}
+
+struct LenientDuration;
+
+impl<'de> serde::de::Visitor<'de> for LenientDuration {
+    type Value = u64;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a duration such as 30d, 1h30m or 90s")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<u64, E> {
+        Ok(parse_duration(value).unwrap_or(0))
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_unit<E>(self) -> Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_none<E>(self) -> Result<u64, E> {
+        Ok(0)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<u64, A::Error> {
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(0)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<u64, A::Error> {
+        while map
+            .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+            .is_some()
+        {}
+        Ok(0)
+    }
+}
+
+/// `90s`, `15m`, `1h30m`, `30d` in milliseconds, or `None` for anything else,
+/// zero included.
 fn parse_duration(value: &str) -> Option<u64> {
-    let mut units = [('h', HOUR), ('m', MINUTE), ('s', SECOND)].into_iter();
+    let mut units = [('d', DAY), ('h', HOUR), ('m', MINUTE), ('s', SECOND)].into_iter();
     let mut rest = value;
     let mut total: u64 = 0;
     while !rest.is_empty() {
@@ -1422,10 +1728,15 @@ pub(super) mod tests {
             ("90s", 90 * SECOND),
             ("15m", 15 * MINUTE),
             ("1h30m", 90 * MINUTE),
+            ("30d", 30 * DAY),
+            ("1d12h", DAY + 12 * HOUR),
         ] {
             assert_eq!(parse_duration(value), Some(ms), "{value}");
         }
-        for value in ["", "0s", "600", "m", "1m1h", "1h1h", "1d", " 1m", "-1m"] {
+        // Each unit once, largest first: `d` joins the front of that order.
+        for value in [
+            "", "0s", "600", "m", "1m1h", "1h1h", "1d1d", "1h1d", "1m1d", " 1m", "-1m",
+        ] {
             assert_eq!(parse_duration(value), None, "{value}");
         }
     }
@@ -2272,5 +2583,217 @@ pub(super) mod tests {
         assert_eq!(Provider::typ(&parse(&policy()).providers[0]), None);
         let err = parse_err(&with("/providers/0/typ", json!("")));
         assert!(err.contains("providers[0].typ must not be empty"), "{err}");
+    }
+
+    /// A `rotation` the broker would act on: 25h of overlap outlives the
+    /// longest `max_ttl` the test policy's profiles hand out, and 30d is more
+    /// than twice it.
+    fn rotation(enabled: bool) -> Value {
+        json!({
+            "enabled": enabled,
+            "every": "30d",
+            "overlap": "25h",
+            "secret": { "store_id": ACCOUNT_ID, "name": "cloudflare-token" },
+        })
+    }
+
+    #[test]
+    fn rolls_its_own_token_only_when_asked_to() {
+        // Nothing said: the broker never touches its own token.
+        assert!(parse(&policy()).rotation().is_none());
+
+        let on = parse(&with("/rotation", rotation(true)));
+        let config = on.rotation().expect("it rolls");
+        assert_eq!(config.every, 30 * DAY);
+        assert_eq!(config.overlap, 25 * HOUR);
+        let secret = config.secret.as_ref().expect("the secret it writes to");
+        assert_eq!(secret.store_id, ACCOUNT_ID);
+        assert_eq!(secret.name, "cloudflare-token");
+
+        // Carried but switched off: read and checked, never acted on.
+        assert!(
+            parse(&with("/rotation", rotation(false)))
+                .rotation()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_a_rotation_it_cant_roll_safely() {
+        /// One way to spoil the `rotation` table.
+        type Spoil = fn(&mut Value);
+
+        let cases: [(Spoil, &str); 8] = [
+            (
+                |t| t["every"] = json!("12h"),
+                "rotation.every must be a duration of at least 1d",
+            ),
+            (
+                |t| t["every"] = json!("400d"),
+                "rotation.every must be at most 365d",
+            ),
+            (
+                |t| {
+                    t["every"] = json!("2d");
+                    t["overlap"] = json!("30m");
+                },
+                "rotation.overlap must be a duration of at least 1h",
+            ),
+            (
+                |t| t["overlap"] = json!("20d"),
+                "rotation.overlap must be at most half of rotation.every",
+            ),
+            (
+                |t| t["secret"]["store_id"] = json!("nope"),
+                "rotation.secret.store_id must be 32 lowercase hex characters",
+            ),
+            (
+                |t| t["secret"]["name"] = json!("a secret"),
+                "rotation.secret.name must be 1-255 of [A-Za-z0-9_.-]",
+            ),
+            (
+                |t| t["secret"]["name"] = json!(""),
+                "rotation.secret.name must be 1-255 of [A-Za-z0-9_.-]",
+            ),
+            (|t| t["extra"] = json!(1), "unknown field `extra`"),
+        ];
+        for (mutate, expected) in cases {
+            let mut table = rotation(true);
+            mutate(&mut table);
+            let err = parse_err(&with("/rotation", table));
+            assert!(err.contains(expected), "{err}\nshould contain\n{expected}");
+        }
+    }
+
+    /// Deleting the replaced token takes the R2 credentials it fathered with
+    /// it, so the overlap has to outlive the longest one a profile hands out.
+    /// Switched off, a bad rotation rolls nothing, so it mustn't be able to
+    /// take every request down with it: an opt-in nobody opted into is inert,
+    /// however badly it's written.
+    #[test]
+    fn a_rotation_thats_switched_off_cant_break_the_policy() {
+        for spoil in ["12h", "", "1 month"] {
+            let mut table = rotation(false);
+            table["every"] = json!(spoil);
+            let policy = parse(&with("/rotation", table));
+            assert!(policy.rotation().is_none(), "{spoil}");
+        }
+        let mut table = rotation(false);
+        table["overlap"] = json!("1m");
+        assert!(parse(&with("/rotation", table)).rotation().is_none());
+
+        // Not only bad values: a shape the table can't be read as mustn't
+        // take the policy down either, when nobody has switched it on.
+        let mut table = rotation(false);
+        table["every"] = json!(30);
+        assert!(parse(&with("/rotation", table)).rotation().is_none());
+        let mut table = rotation(false);
+        table["overlap"] = json!(["25h"]);
+        assert!(parse(&with("/rotation", table)).rotation().is_none());
+        let mut table = rotation(false);
+        table.as_object_mut().unwrap().remove("secret");
+        assert!(parse(&with("/rotation", table)).rotation().is_none());
+
+        // Half a secret is no better than none: `store_id` and `name` are
+        // defaulted, and read leniently, so one that's incomplete or the wrong
+        // shape warns rather than refusing.
+        for field in ["store_id", "name"] {
+            let mut table = rotation(false);
+            table["secret"].as_object_mut().unwrap().remove(field);
+            assert!(
+                parse(&with("/rotation", table)).rotation().is_none(),
+                "{field} missing"
+            );
+            for shape in [json!(123), json!(true), json!(["x"]), json!(null)] {
+                let mut table = rotation(false);
+                table["secret"][field] = shape.clone();
+                assert!(
+                    parse(&with("/rotation", table)).rotation().is_none(),
+                    "{field} = {shape}"
+                );
+            }
+        }
+
+        // Switched on, each of those is refused, naming the field.
+        for (field, value, says) in [
+            ("every", json!(30), "rotation.every must be a duration"),
+            (
+                "overlap",
+                json!(["25h"]),
+                "rotation.overlap must be a duration",
+            ),
+        ] {
+            let mut table = rotation(true);
+            table[field] = value;
+            let err = parse_err(&with("/rotation", table));
+            assert!(err.contains(says), "{err}");
+        }
+        let mut table = rotation(true);
+        table.as_object_mut().unwrap().remove("secret");
+        let err = parse_err(&with("/rotation", table));
+        assert!(err.contains("rotation.secret must name"), "{err}");
+        for (field, says) in [
+            ("store_id", "rotation.secret.store_id must be 32"),
+            ("name", "rotation.secret.name must be 1-255"),
+        ] {
+            let mut table = rotation(true);
+            table["secret"].as_object_mut().unwrap().remove(field);
+            let err = parse_err(&with("/rotation", table));
+            assert!(err.contains(says), "{err}");
+
+            let mut table = rotation(true);
+            table["secret"][field] = json!(123);
+            let err = parse_err(&with("/rotation", table));
+            assert!(err.contains(says), "{err}");
+        }
+
+        // A field it doesn't know is still refused, switched on or not: the
+        // broker can't tell a misspelling from a setting it should honour,
+        // and every other table in the policy is held to the same rule.
+        let mut table = rotation(false);
+        table["evry"] = json!("30d");
+        let err = parse_err(&with("/rotation", table));
+        assert!(err.contains("unknown field `evry`"), "{err}");
+
+        // Switched on, the same values are refused.
+        let mut table = rotation(true);
+        table["every"] = json!("12h");
+        let err = parse_err(&with("/rotation", table));
+        assert!(
+            err.contains("rotation.every must be a duration of at least 1d"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn makes_the_overlap_outlive_the_credentials_it_would_cut_short() {
+        let mut policy = with("/rotation", rotation(true));
+        policy["profiles"][0]["max_ttl"] = json!("20h");
+        parse(&policy);
+
+        policy["profiles"][0]["max_ttl"] = json!("24h");
+        policy["rotation"]["overlap"] = json!("23h");
+        let err = parse_err(&policy);
+        assert!(
+            err.contains("rotation.overlap must be longer than the longest max_ttl"),
+            "{err}"
+        );
+
+        // Equal isn't enough: a credential minted the instant the binding
+        // hands over lives exactly as long as the window, so it has to be
+        // longer, not as long.
+        policy["rotation"]["overlap"] = json!("24h");
+        let err = parse_err(&policy);
+        assert!(
+            err.contains("rotation.overlap must be longer than the longest max_ttl"),
+            "{err}"
+        );
+        policy["rotation"]["overlap"] = json!("24h1m");
+        parse(&policy);
+
+        // A profile that's switched off hands out nothing, so it doesn't count.
+        policy["profiles"][0]["max_ttl"] = json!("1h");
+        policy["profiles"][1]["max_ttl"] = json!("24h");
+        parse(&policy);
     }
 }
