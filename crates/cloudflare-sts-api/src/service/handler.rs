@@ -494,7 +494,12 @@ impl TokenServiceApi for TokenServiceHandler {
             };
 
             match exchanged.await {
-                Ok(response) => v1::ExchangeTokenResponse::Ok(response),
+                Ok(response) => v1::ExchangeTokenResponse::Ok(
+                    response,
+                    v1::ExchangeTokenResponseOkHeaders {
+                        cache_control: "no-store".to_string(),
+                    },
+                ),
                 Err(err) => {
                     let profile = named
                         .as_ref()
