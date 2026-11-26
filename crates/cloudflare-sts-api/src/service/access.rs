@@ -45,7 +45,9 @@ struct CreatedResult {
     expires_at: Option<DateTime<Utc>>,
 }
 
-fn failure(status: u16, body: &Value) -> Failure {
+/// A [`Failure`] from a status and a body: the shape every handwritten
+/// Cloudflare call here reports, including [`secrets`](super::secrets).
+pub(super) fn failure(status: u16, body: &Value) -> Failure {
     let said = body
         .pointer("/errors/0/message")
         .and_then(Value::as_str)

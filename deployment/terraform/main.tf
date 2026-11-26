@@ -44,8 +44,25 @@ locals {
       profiles = var.profiles
     },
     { for key, value in { defaults = local.defaults } : key => value if length(value) > 0 },
+    local.rotation,
   )
-  defaults    = { for key, value in var.defaults : key => value if value != null }
+  defaults = { for key, value in var.defaults : key => value if value != null }
+
+  # Which secret the broker writes its replacement token into is the binding's,
+  # said again: a Secrets Store binding can only be read, so the broker goes
+  # over the API, which needs the store and the name. Taken from the same
+  # variable as the binding, so the two can't drift apart.
+  rotation = var.token_rotation == null ? {} : {
+    rotation = {
+      enabled = var.token_rotation.enabled
+      every   = var.token_rotation.every
+      overlap = var.token_rotation.overlap
+      secret = {
+        store_id = var.cloudflare_token_secret.secret_store_id
+        name     = var.cloudflare_token_secret.secret_name
+      }
+    }
+  }
   config_json = jsonencode(local.policy)
 }
 
@@ -148,7 +165,8 @@ resource "cloudflare_workers_custom_domain" "this" {
   depends_on = [cloudflare_workers_deployment.this]
 }
 
-# Hourly cleanup of expired cloudflare-sts:* tokens.
+# Hourly: the cleanup of expired cloudflare-sts:* tokens, and, with
+# token_rotation, replacing the broker's own Cloudflare token when it's due.
 resource "cloudflare_workers_cron_trigger" "this" {
   account_id  = var.account_id
   script_name = cloudflare_worker.this.name

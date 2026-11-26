@@ -463,3 +463,115 @@ run "profile_with_an_access" {
     error_message = "an access should reach the policy beside a token"
   }
 }
+
+run "no_token_rotation_unless_asked_for" {
+  command = plan
+
+  assert {
+    condition     = !contains(keys(jsondecode(local.config_json)), "rotation")
+    error_message = "without token_rotation the policy should say nothing about rotation, so the broker never touches its own token"
+  }
+}
+
+run "token_rotation_names_the_bound_secret" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = true }
+  }
+
+  assert {
+    condition     = jsondecode(local.config_json).rotation.enabled && jsondecode(local.config_json).rotation.every == "30d" && jsondecode(local.config_json).rotation.overlap == "25h"
+    error_message = "token_rotation should reach the policy, with the module's defaults filled in"
+  }
+
+  # The secret the broker writes to has to be the one its binding reads, or it
+  # would replace a token nothing uses.
+  assert {
+    condition = anytrue([
+      for b in cloudflare_worker_version.this.bindings :
+      b.name == "CLOUDFLARE_STS_API_CLOUDFLARE_TOKEN" &&
+      b.store_id == jsondecode(local.config_json).rotation.secret.store_id &&
+      b.secret_name == jsondecode(local.config_json).rotation.secret.name
+    ])
+    error_message = "rotation.secret should be the Secrets Store secret the Worker is bound to"
+  }
+}
+
+run "token_rotation_can_be_carried_switched_off" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = false, every = "90d", overlap = "1d2h" }
+  }
+
+  assert {
+    condition     = !jsondecode(local.config_json).rotation.enabled && jsondecode(local.config_json).rotation.every == "90d"
+    error_message = "a disabled token_rotation should still reach the policy, so the broker checks it before it's switched on"
+  }
+}
+
+run "rejects_a_rotation_period_that_isnt_a_duration" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = true, every = "1 month" }
+  }
+
+  expect_failures = [var.token_rotation]
+}
+
+# The broker refuses these when it loads the policy. Catching them in the plan
+# keeps an apply from publishing a policy the Worker then rejects on every
+# request.
+run "rejects_an_empty_rotation_period" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = true, every = "" }
+  }
+
+  expect_failures = [var.token_rotation]
+}
+
+run "rejects_a_rotation_period_under_a_day" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = true, every = "12h" }
+  }
+
+  expect_failures = [var.token_rotation]
+}
+
+run "rejects_a_zero_overlap" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = true, overlap = "0s" }
+  }
+
+  expect_failures = [var.token_rotation]
+}
+
+run "rejects_an_overlap_over_half_the_period" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = true, every = "2d", overlap = "25h" }
+  }
+
+  expect_failures = [var.token_rotation]
+}
+
+# Switched off is no excuse: the module writes the table either way, and a
+# deployment shouldn't carry settings that won't work when it switches them on.
+run "rejects_a_bad_rotation_even_when_switched_off" {
+  command = plan
+
+  variables {
+    token_rotation = { enabled = false, every = "12h" }
+  }
+
+  expect_failures = [var.token_rotation]
+}

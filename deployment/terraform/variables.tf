@@ -34,7 +34,55 @@ variable "cloudflare_token_secret" {
     secret_store_id = string
     secret_name     = string
   })
-  description = "Secrets Store secret holding the Cloudflare token: an account-owned token with \"Account API Tokens Write\", plus R2 permissions covering what profiles' buckets delegate (it creates those credentials and is their parent), plus \"Access: Service Tokens Write\" if any profile has an `access`. Terraform only references it; the value never enters state."
+  description = "Secrets Store secret holding the Cloudflare token: an account-owned token with \"Account API Tokens Write\", plus R2 permissions covering what profiles' buckets delegate (it creates those credentials and is their parent), plus \"Access: Service Tokens Write\" if any profile has an `access`, plus \"Secrets Store Write\" if token_rotation is enabled (the broker writes its replacement back here). Terraform only references it; the value never enters state."
+}
+
+variable "token_rotation" {
+  type = object({
+    enabled = optional(bool, false)
+    every   = optional(string, "30d")
+    overlap = optional(string, "25h")
+  })
+  description = "Opt in to the broker replacing its own Cloudflare token. On the hourly cron it copies the token, writes the copy into the Secrets Store secret above, and deletes the one it replaced `overlap` after the Worker is seen to have picked the copy up; `every` is how old the token may get first. The overlap must outlast the longest `max_ttl` a profile hands out, because deleting the replaced token invalidates the R2 credentials it is the parent of, and be at most half of `every`. Leave unset and the broker never touches its own token. Its token then needs \"Secrets Store Write\". Enable it in a separate apply, after the Worker is already running a version that understands it: see Upgrading."
+  default     = null
+
+  # The broker checks these again when it loads the policy, and is the
+  # authority; these mirror its bounds so a mistake is a plan error rather than
+  # a deployed policy the Worker refuses. `d`, `h`, `m`, `s`, largest first,
+  # each at most once, at least one of them.
+  #
+  # Written as `cond ? ... : true` rather than `null || ...`, and wrapped in
+  # `try`: a logical operator that evaluates both sides would otherwise reach
+  # into a null `token_rotation`, and `sum([])` on an empty match would fail
+  # with its own error instead of the message below.
+  validation {
+    condition = var.token_rotation == null ? true : try(
+      can(regex("^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$", var.token_rotation.every))
+      && length(regexall("[0-9]+[dhms]", var.token_rotation.every)) > 0
+      && sum([for p in regexall("([0-9]+)([dhms])", var.token_rotation.every) : tonumber(p[0]) * lookup({ d = 86400, h = 3600, m = 60, s = 1 }, p[1], 0)]) >= 86400
+      && sum([for p in regexall("([0-9]+)([dhms])", var.token_rotation.every) : tonumber(p[0]) * lookup({ d = 86400, h = 3600, m = 60, s = 1 }, p[1], 0)]) <= 31536000
+    , false)
+    error_message = "token_rotation.every must be a duration between 1d and 365d, largest unit first, such as 30d, 720h or 1d12h."
+  }
+
+  validation {
+    condition = var.token_rotation == null ? true : try(
+      can(regex("^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$", var.token_rotation.overlap))
+      && length(regexall("[0-9]+[dhms]", var.token_rotation.overlap)) > 0
+      && sum([for p in regexall("([0-9]+)([dhms])", var.token_rotation.overlap) : tonumber(p[0]) * lookup({ d = 86400, h = 3600, m = 60, s = 1 }, p[1], 0)]) >= 3600
+    , false)
+    error_message = "token_rotation.overlap must be a duration of at least 1h, largest unit first, such as 25h or 1d1h."
+  }
+
+  # Only meaningful once both parse. A duration that doesn't is reported by its
+  # own check above, so this one passes rather than piling on a second message.
+  validation {
+    condition = var.token_rotation == null ? true : try(
+      sum([for p in regexall("([0-9]+)([dhms])", var.token_rotation.overlap) : tonumber(p[0]) * lookup({ d = 86400, h = 3600, m = 60, s = 1 }, p[1], 0)]) * 2
+      <= sum([for p in regexall("([0-9]+)([dhms])", var.token_rotation.every) : tonumber(p[0]) * lookup({ d = 86400, h = 3600, m = 60, s = 1 }, p[1], 0)])
+    , true)
+    error_message = "token_rotation.overlap must be at most half of token_rotation.every."
+  }
 }
 
 variable "oidc_providers" {
